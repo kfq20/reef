@@ -225,3 +225,147 @@ def test_policy_loss_matches_slime(reference) -> None:
 
     numpy.testing.assert_allclose(numpy.array(got_loss), want_loss.numpy(), rtol=1e-5, atol=1e-6)
     numpy.testing.assert_allclose(numpy.array(got_clip), want_clip.numpy(), rtol=1e-5, atol=1e-6)
+
+
+def _engine_and_row(capture=8):
+    """A real rollout with captured candidates and two teacher hints."""
+    from reef.train.mlx_backend.engine import (
+        DistillationRow,
+        MLXEngine,
+        MLXEngineConfig,
+        TeacherCandidate,
+    )
+
+    engine = MLXEngine(
+        MLXEngineConfig(
+            model_path="mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+            lora_layers=4,
+            max_tokens=24,
+            capture_topk=capture,
+            learning_rate=1e-4,
+            seed=0,
+        )
+    )
+    prompt = engine.render_prompt([{"role": "user", "content": "Summarise the result."}])
+    rollout = engine.generate(prompt)
+    response_length = len(rollout.output_tokens)
+
+    def teacher_tokens(hint: str) -> tuple[int, ...]:
+        hinted = engine.render_prompt([{"role": "user", "content": f"Summarise the result.\n\n[hint] {hint}"}])
+        return (*hinted, *rollout.output_tokens)
+
+    row = DistillationRow(
+        tokens=(*prompt, *rollout.output_tokens),
+        loss_mask=(1,) * response_length,
+        rollout_log_probs=rollout.rollout_log_probs,
+        reward=1.0,
+        topk_indices=rollout.topk_indices,
+        topk_log_probs=rollout.topk_log_probs,
+        candidates=(
+            TeacherCandidate("Be terse.", teacher_tokens("Be terse.")),
+            TeacherCandidate("Write plain prose.", teacher_tokens("Write plain prose.")),
+        ),
+    )
+    return engine, row
+
+
+def _step_loss(engine, row, *, w_rl: float, w_opd: float) -> float:
+    before = engine.adapter_snapshot()
+    metrics = engine.openclawrl_step(
+        [row],
+        w_rl=w_rl,
+        w_opd=w_opd,
+        eps_lo=0.2,
+        eps_hi=0.28,
+        diff_clip=1.0,
+        hint_selection="sequence_optimal",
+        native_k=8,
+    )
+    # Roll the weights back so each weighting is measured from the same point.
+    engine.apply_adapter(before)
+    return float(metrics["loss"])
+
+
+@pytest.mark.integration
+def test_the_two_terms_combine_linearly() -> None:
+    # loss = w_rl * reward_term + w_opd * distillation_term. Measuring each
+    # weighting from the same parameters makes that additivity checkable, and
+    # it is the property that would break first if the terms were wired to
+    # the wrong tensors.
+    engine, row = _engine_and_row()
+    try:
+        both = _step_loss(engine, row, w_rl=1.0, w_opd=1.0)
+        reward_only = _step_loss(engine, row, w_rl=1.0, w_opd=0.0)
+        distil_only = _step_loss(engine, row, w_rl=0.0, w_opd=1.0)
+    finally:
+        engine.close()
+
+    assert reward_only != 0.0
+    assert distil_only != 0.0
+    assert both == pytest.approx(reward_only + distil_only, rel=1e-3, abs=1e-4)
+
+
+@pytest.mark.integration
+def test_each_term_moves_the_adapter_on_its_own() -> None:
+    # Either term alone must produce a real update: a weighting that silently
+    # trains nothing is the failure this whole path is built to refuse.
+    engine, row = _engine_and_row()
+    try:
+        for w_rl, w_opd in ((1.0, 0.0), (0.0, 1.0)):
+            before = engine.adapter_snapshot()
+            engine.openclawrl_step(
+                [row],
+                w_rl=w_rl,
+                w_opd=w_opd,
+                eps_lo=0.2,
+                eps_hi=0.28,
+                diff_clip=1.0,
+                hint_selection="sequence_optimal",
+                native_k=8,
+            )
+            delta, changed = engine.adapter_delta(before, engine.adapter_snapshot())
+            engine.apply_adapter(before)
+            assert delta > 0.0, (w_rl, w_opd)
+            assert changed == len(before), (w_rl, w_opd)
+    finally:
+        engine.close()
+
+
+@pytest.mark.integration
+def test_the_teacher_pass_leaves_the_adapter_where_it_found_it() -> None:
+    # The teacher is the frozen base, reached by zeroing lora_b in place. If
+    # that were not restored, serving would answer from the bare base model.
+    # Checked on the pass itself rather than through a step, because the
+    # optimizer moves the weights even at zero gradient (AdamW decays them).
+    engine, row = _engine_and_row()
+    try:
+        before = engine.adapter_snapshot()
+        gathered, native = engine._run(lambda: engine._teacher_rows(row, 8))
+        delta, changed = engine.adapter_delta(before, engine.adapter_snapshot())
+    finally:
+        engine.close()
+
+    assert len(gathered) == 2 and len(native) == 2
+    assert delta == 0.0
+    assert changed == 0
+
+
+@pytest.mark.integration
+def test_an_unimplemented_hint_selection_is_refused() -> None:
+    from reef.train.mlx_backend.engine import MLXEngineError
+
+    engine, row = _engine_and_row()
+    try:
+        with pytest.raises(MLXEngineError, match="hint selection"):
+            engine.openclawrl_step(
+                [row],
+                w_rl=1.0,
+                w_opd=1.0,
+                eps_lo=0.2,
+                eps_hi=0.28,
+                diff_clip=1.0,
+                hint_selection="token_optimal",
+                native_k=8,
+            )
+    finally:
+        engine.close()

@@ -37,7 +37,7 @@ CANDIDATE_DIRNAME = "candidate-{scenario_step}-{candidate}"
 #: Loss families this runtime actually implements in MLX. A recipe asking for
 #: anything else is refused before training rather than trained under the
 #: wrong objective.
-SUPPORTED_LOSS_FAMILIES = frozenset({"tttd"})
+SUPPORTED_LOSS_FAMILIES = frozenset({"tttd", "openclawrl"})
 
 
 class MLXRuntime(TrainingRuntime):
@@ -52,6 +52,7 @@ class MLXRuntime(TrainingRuntime):
         inference_timeout_s: float = 300.0,
         kl_coef: float = 0.0,
         adapter_name: str = "reef-mlx",
+        openclawrl: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(base_url=base_url, inference_timeout_s=inference_timeout_s)
         self._engine = engine
@@ -59,6 +60,18 @@ class MLXRuntime(TrainingRuntime):
         self._checkpoint_root.mkdir(parents=True, exist_ok=True)
         self._kl_coef = float(kl_coef)
         self._adapter_name = adapter_name
+        #: Objective knobs for the openclawrl loss family. Defaults match
+        #: ``recipes/openclawrl/slime``'s ``OpenclawrlSettings``.
+        self._openclawrl: dict[str, Any] = {
+            "w_rl": 1.0,
+            "w_opd": 1.0,
+            "eps_lo": 0.2,
+            "eps_hi": 0.28,
+            "diff_clip": 1.0,
+            "hint_selection": "sequence_optimal",
+            "native_k": 20,
+            **dict(openclawrl or {}),
+        }
         # The freshly loaded base plus its zero-initialised adapter is already
         # a servable version, and every durable training record must name the
         # weights that answered it. Minting the identity at boot is what lets
@@ -103,6 +116,7 @@ class MLXRuntime(TrainingRuntime):
             "lora_rank": config.lora_rank,
             "learning_rate": config.learning_rate,
             "kl_coef": self._kl_coef,
+            "openclawrl": dict(self._openclawrl),
         }
 
     # --------------------------------------------------------------- training
@@ -170,7 +184,11 @@ class MLXRuntime(TrainingRuntime):
             unsupported.append(f"epochs={scheduling.epochs}")
         if scheduling.shuffle:
             unsupported.append("shuffle=True")
-        if scheduling.batch_size != "actual":
+        # "configured" names the backend's own batch size, and a single
+        # process has none: the reserved batch is the step either way. An
+        # explicit integer does mean sub-batching, which this runtime would
+        # silently collapse into one step, so that stays refused.
+        if scheduling.batch_size not in ("actual", "configured"):
             unsupported.append(f"batch_size={scheduling.batch_size!r}")
         if unsupported:
             raise RuntimeContractError(
@@ -178,18 +196,69 @@ class MLXRuntime(TrainingRuntime):
                 f"{', '.join(unsupported)}. Supported: epochs=1, shuffle=False, batch_size='actual'."
             )
 
-    def train_candidate(self, payload: Mapping[str, Any]) -> ModelCandidate:
-        """Train through an exported adapter without changing serving weights.
+    def _distillation_rows(self, samples: Sequence[PolicySample], advantages: Sequence[float]) -> list[Any]:
+        """Turn reserved samples into the rows the distillation step consumes.
 
-        Serving is restored to its pre-step parameters before returning, so a
-        candidate that Reef later rejects never touched the weights answering
-        requests.
+        Two channels have to be present and cannot be rebuilt afterwards: the
+        candidate set captured while generating, and the teacher sequences the
+        judge's hints produced. Missing either is a configuration error worth
+        naming precisely, because the alternative is training a distillation
+        objective on no teacher at all.
         """
-        from reef.train.mlx_backend.engine import TrainingRow
+        from reef.train.mlx_backend.engine import DistillationRow, TeacherCandidate
 
+        rows = []
+        for index, (sample, advantage) in enumerate(zip(samples, advantages, strict=True)):
+            if not sample.topk_indices or not sample.topk_log_probs:
+                raise RuntimeContractError(
+                    f"sample {index} carries no generation top-K; the openclawrl objective distils onto "
+                    "the candidates the policy considered, so set reef.runtime_config.capture_topk"
+                )
+            raw = sample.extras.get("teacher_cands")
+            if not raw:
+                raise RuntimeContractError(
+                    f"sample {index} carries no teacher candidates; the processor attaches them as "
+                    "extras['teacher_cands'] once the judge has proposed a hindsight hint"
+                )
+            candidates = tuple(
+                TeacherCandidate(
+                    hint=str(entry.get("hint", "")),
+                    tokens=tuple(int(token) for token in entry["teacher_tokens"]),
+                )
+                for entry in raw
+            )
+            rows.append(
+                DistillationRow(
+                    tokens=sample.tokens,
+                    loss_mask=sample.loss_mask,
+                    rollout_log_probs=sample.rollout_log_probs,
+                    reward=float(advantage),
+                    topk_indices=sample.topk_indices,
+                    topk_log_probs=sample.topk_log_probs,
+                    candidates=candidates,
+                )
+            )
+        return rows
+
+    def _run_training(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Dispatch to the objective the recipe's loss family names."""
         samples: Sequence[PolicySample] = payload["samples"]
         advantages: Sequence[float] = payload["advantages"]
-        scenario_step = int(payload["rollout_id"])
+        if payload.get("loss_family") == "openclawrl":
+            rows = self._distillation_rows(samples, advantages)
+            return dict(
+                self._engine.openclawrl_step(
+                    rows,
+                    w_rl=self._openclawrl["w_rl"],
+                    w_opd=self._openclawrl["w_opd"],
+                    eps_lo=self._openclawrl["eps_lo"],
+                    eps_hi=self._openclawrl["eps_hi"],
+                    diff_clip=self._openclawrl["diff_clip"],
+                    hint_selection=self._openclawrl["hint_selection"],
+                    native_k=self._openclawrl["native_k"],
+                )
+            )
+        from reef.train.mlx_backend.engine import TrainingRow
 
         rows = [
             TrainingRow(
@@ -200,6 +269,18 @@ class MLXRuntime(TrainingRuntime):
             )
             for sample, advantage in zip(samples, advantages, strict=True)
         ]
+        if self._kl_coef:
+            rows = self._apply_frozen_base_kl(rows)
+        return dict(self._engine.train_step(rows))
+
+    def train_candidate(self, payload: Mapping[str, Any]) -> ModelCandidate:
+        """Train through an exported adapter without changing serving weights.
+
+        Serving is restored to its pre-step parameters before returning, so a
+        candidate that Reef later rejects never touched the weights answering
+        requests.
+        """
+        scenario_step = int(payload["rollout_id"])
         current = self.current_runtime_load_id()
         before = self._engine.adapter_snapshot()
         # One admission window covers everything that touches the live
@@ -208,9 +289,7 @@ class MLXRuntime(TrainingRuntime):
         # generate from the bare base model.
         self._inference_admission.close(wait=True, timeout=self.inference_timeout_s)
         try:
-            if self._kl_coef:
-                rows = self._apply_frozen_base_kl(rows)
-            metrics = dict(self._engine.train_step(rows))
+            metrics = self._run_training(payload)
             after = self._engine.adapter_snapshot()
             delta, changed = self._engine.adapter_delta(before, after)
             metrics.update(adapter_delta_l2=delta, adapter_tensors_changed=changed)
@@ -426,6 +505,7 @@ class MLXRuntimeFactory(RuntimeFactory):
             kl_coef=float(config.get("kl_coef", 0.0)),
             inference_timeout_s=float(timeout) if timeout else 300.0,
             adapter_name=str(config.get("adapter_name", "reef-mlx")),
+            openclawrl=config.get("openclawrl") if isinstance(config.get("openclawrl"), Mapping) else None,
         )
 
 

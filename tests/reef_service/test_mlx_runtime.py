@@ -23,7 +23,7 @@ from reef.train.algos.base import register_step_preparer
 from reef.train.algos.signals import StepScheduling, StepSignal
 from reef.train.evaluation.contracts import EvaluationResult, SelectionDecision
 from reef.train.mlx_backend.runtime import MLXRuntime
-from reef.train.types import PolicySample, PolicyBatch
+from reef.train.types import PolicyBatch, PolicySample
 
 
 class FakeEngineConfig:
@@ -48,6 +48,7 @@ class FakeEngine:
         self.saved: list[Path] = []
         self.loaded: list[Path] = []
         self.trained_rows: list[Any] = []
+        self.distillation_rows: list[Any] | None = None
 
     def adapter_snapshot(self) -> dict[str, float]:
         return dict(self.weights)
@@ -64,6 +65,12 @@ class FakeEngine:
         if self.moved:
             self.weights = {name: value + 1.0 for name, value in self.weights.items()}
         return {"loss": -1.0, "rows": len(rows)}
+
+    def openclawrl_step(self, rows, **settings) -> dict[str, Any]:
+        self.distillation_rows = list(rows)
+        if self.moved:
+            self.weights = {name: value + 1.0 for name, value in self.weights.items()}
+        return {"loss": -1.0, "rows": len(rows), **settings}
 
     def base_log_probs(self, rows) -> list[list[float]]:
         return [[-1.0] * len(row.loss_mask) for row in rows]
@@ -466,3 +473,99 @@ def test_an_empty_completion_is_refused_so_a_grid_cannot_stall() -> None:
     backend = MLXInferenceBackend(runtime)
     with pytest.raises(UpstreamStatusError, match="no response tokens"):
         asyncio.run(backend.inference(Artifact.local(Path("/tmp")), "/v1/chat/completions", {"messages": [{}]}))
+
+
+@register_step_preparer
+class _OpenClawRLPreparer(StepPreparer):
+    name = "mlx-test-openclawrl"
+
+    def __call__(self, batch, state):
+        return StepSignal(
+            "train",
+            "openclawrl",
+            {},
+            {},
+            tuple(sample.reward for sample in batch.samples),
+            # The real preparer leaves scheduling at its default, which names
+            # the backend's own batch size.
+            StepScheduling(),
+        )
+
+
+@register_step_preparer
+class _SubBatchedPreparer(StepPreparer):
+    name = "mlx-test-subbatched"
+
+    def __call__(self, batch, state):
+        return StepSignal("train", "tttd", {}, {}, (1.0, -1.0), StepScheduling(unit="sample", batch_size=4))
+
+
+def _distillation_sample(*, topk=True, teacher=True) -> PolicySample:
+    extras = {}
+    if teacher:
+        extras["teacher_cands"] = ({"hint": "Be terse.", "teacher_tokens": [7, 8, 1, 2]},)
+    return PolicySample(
+        source_agent_record_id="turn-1",
+        tokens=(5, 6, 1, 2),
+        loss_mask=(1, 1),
+        rollout_log_probs=(-0.5, -0.25),
+        reward=1.0,
+        topk_indices=((1, 3), (2, 4)) if topk else (),
+        topk_log_probs=((-0.5, -2.0), (-0.25, -3.0)) if topk else (),
+        extras=extras,
+    )
+
+
+@pytest.mark.unit
+def test_a_configured_batch_size_is_accepted_but_sub_batching_is_not(tmp_path: Path) -> None:
+    # "configured" names a backend batch size that a single process does not
+    # have, so the reserved batch is the step either way. An explicit integer
+    # really does mean several steps, which this runtime cannot honour.
+    runtime = build_runtime(tmp_path)
+    batch = PolicyBatch("b", (_distillation_sample(),))
+
+    prepared = runtime.prepare_training_step(batch, "mlx-test-openclawrl", {}, 0)
+    assert prepared.action == "train"
+
+    with pytest.raises(RuntimeContractError, match="batch_size=4"):
+        runtime.prepare_training_step(batch, "mlx-test-subbatched", {}, 0)
+
+
+@pytest.mark.unit
+def test_the_distillation_objective_refuses_a_batch_with_no_captured_candidates(tmp_path: Path) -> None:
+    # Training a distillation objective on rollouts that recorded no candidate
+    # set would silently optimise nothing; say which setting is missing.
+    runtime = build_runtime(tmp_path)
+    batch = PolicyBatch("b", (_distillation_sample(topk=False),))
+    prepared = runtime.prepare_training_step(batch, "mlx-test-openclawrl", {}, 0)
+
+    with pytest.raises(RuntimeContractError, match="capture_topk"):
+        runtime.train_candidate(prepared.payload)
+
+
+@pytest.mark.unit
+def test_the_distillation_objective_refuses_a_batch_with_no_teacher(tmp_path: Path) -> None:
+    runtime = build_runtime(tmp_path)
+    batch = PolicyBatch("b", (_distillation_sample(teacher=False),))
+    prepared = runtime.prepare_training_step(batch, "mlx-test-openclawrl", {}, 0)
+
+    with pytest.raises(RuntimeContractError, match="teacher_cands"):
+        runtime.train_candidate(prepared.payload)
+
+
+@pytest.mark.unit
+def test_the_openclawrl_family_reaches_the_distillation_step(tmp_path: Path) -> None:
+    runtime = build_runtime(tmp_path)
+    engine = runtime.engine
+    batch = PolicyBatch("b", (_distillation_sample(),))
+    prepared = runtime.prepare_training_step(batch, "mlx-test-openclawrl", {}, 0)
+
+    candidate = runtime.train_candidate(prepared.payload)
+
+    # The distillation step ran, not the policy-gradient one.
+    assert engine.distillation_rows is not None
+    assert engine.trained_rows == []
+    row = engine.distillation_rows[0]
+    assert row.reward == 1.0
+    assert row.candidates[0].hint == "Be terse."
+    assert candidate.training_metrics["w_opd"] == 1.0

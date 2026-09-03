@@ -135,6 +135,61 @@ class TrainingRow:
 
 
 @dataclass(frozen=True)
+class TeacherCandidate:
+    """One hindsight hint, already rendered to the tokens the teacher scores.
+
+    ``tokens`` is the hint-enhanced prompt followed by the response the policy
+    actually produced, so the teacher answers "what would the base model have
+    said here, had the user asked for this up front".
+    """
+
+    hint: str
+    tokens: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class DistillationRow:
+    """One judged turn: the sampled tokens, the candidates, and the hints.
+
+    Extends what a policy-gradient row carries with the two things a
+    distillation term needs and nothing else can reconstruct — the candidate
+    set the policy considered at each step, and the teacher sequences the
+    judge's hints produced.
+    """
+
+    tokens: tuple[int, ...]
+    loss_mask: tuple[int, ...]
+    rollout_log_probs: tuple[float, ...]
+    reward: float
+    topk_indices: tuple[tuple[int, ...], ...]
+    topk_log_probs: tuple[tuple[float, ...], ...]
+    candidates: tuple[TeacherCandidate, ...]
+
+    def __post_init__(self) -> None:
+        response_length = len(self.loss_mask)
+        if response_length == 0 or len(self.tokens) <= response_length:
+            raise ValueError("a distillation row needs at least one prompt token and one response token")
+        if len(self.topk_indices) != response_length or len(self.topk_log_probs) != response_length:
+            raise ValueError("captured candidates must cover exactly the response tokens")
+        if not self.candidates:
+            raise ValueError("a distillation row needs at least one teacher candidate")
+        for candidate in self.candidates:
+            if len(candidate.tokens) <= response_length:
+                raise ValueError("a teacher sequence must be its prompt plus the whole response")
+
+
+@dataclass(frozen=True)
+class _ObjectiveWeights:
+    """How the two OpenClaw-RL terms combine, and how each is bounded."""
+
+    w_rl: float
+    w_opd: float
+    eps_lo: float
+    eps_hi: float
+    diff_clip: float | None
+
+
+@dataclass(frozen=True)
 class _StepTensors:
     """One micro-batch, padded to a common width.
 
@@ -476,6 +531,246 @@ class MLXEngine:
             "optimizer_step": _as_int(self._optimizer.step),
         }
 
+    # ---------------------------------------------------- distillation (OPD)
+
+    def _response_logits(self, tokens: Sequence[int], response_length: int) -> mx.array:
+        """Logits on the target positions that predict the response tokens.
+
+        Response token ``j`` is predicted from target position
+        ``prompt_length - 1 + j``, so this slice lines up with the captured
+        candidates whatever the prompt length is — which matters because the
+        teacher's prompt is longer than the student's by the hint.
+        """
+        sequence = mx.array([list(tokens)])
+        logits = self._model(sequence[:, :-1])
+        start = len(tokens) - response_length - 1
+        return logits[0, start : start + response_length]
+
+    def _teacher_candidate(
+        self,
+        candidate: TeacherCandidate,
+        response_length: int,
+        student_indices: mx.array,
+        native_k: int,
+    ) -> tuple[mx.array, mx.array]:
+        """Frozen-base log-probs at the student's candidates, plus the base's own.
+
+        The second return is the selection signal: which hint to believe is
+        decided by how far the teacher's own preferred tokens overlap the
+        policy's, so both have to come out of the same forward.
+        """
+        logits = self._response_logits(candidate.tokens, response_length)
+        log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        at_student = mx.take_along_axis(log_probs, student_indices, axis=-1)
+        native = mx.argpartition(-log_probs, kth=native_k - 1, axis=-1)[:, :native_k]
+        mx.eval(at_student, native)
+        return at_student, native
+
+    def _teacher_rows(self, row: DistillationRow, native_k: int) -> tuple[list[mx.array], list[mx.array]]:
+        """Score every hint candidate under the frozen base.
+
+        ``lora_b`` is zeroed for the whole sweep rather than per candidate:
+        the base is the same model for all of them, and restoring between
+        passes would only buy repeated work.
+        """
+        snapshot = self._adapter_snapshot()
+        zeroed = {
+            name: (mx.zeros_like(value) if name.endswith("lora_b") else value) for name, value in snapshot.items()
+        }
+        self._apply_adapter(zeroed)
+        try:
+            student_indices = mx.array([list(candidates) for candidates in row.topk_indices])
+            response_length = len(row.loss_mask)
+            gathered = []
+            native = []
+            for candidate in row.candidates:
+                at_student, own = self._teacher_candidate(candidate, response_length, student_indices, native_k)
+                gathered.append(at_student)
+                native.append(own)
+            return gathered, native
+        finally:
+            self._apply_adapter(snapshot)
+
+    @staticmethod
+    def _select_hint(native_topk: Sequence[mx.array], student_indices: mx.array, selection: str) -> mx.array:
+        """Which hint to believe, per response token.
+
+        ``shortest`` always takes candidate 0 — the rollout module orders them
+        shortest first. ``sequence_optimal`` scores each candidate by how many
+        of its own preferred tokens the policy also considered, summed over
+        the response, and takes the best for every token in it.
+        """
+        rows = student_indices.shape[0]
+        if selection == "shortest" or len(native_topk) == 1:
+            return mx.zeros((rows,), dtype=mx.int32)
+        if selection != "sequence_optimal":
+            raise MLXEngineError(
+                f"the mlx runtime implements hint selection 'shortest' and 'sequence_optimal', got {selection!r}"
+            )
+        overlaps = []
+        for own in native_topk:
+            equal = student_indices[:, :, None] == own[:, None, :]
+            overlaps.append(mx.sum(mx.any(equal, axis=-1).astype(mx.int32), axis=-1))
+        totals = mx.stack([mx.sum(overlap) for overlap in overlaps])
+        mx.eval(totals)
+        best = _as_int(mx.argmax(totals))
+        return mx.full((rows,), best, dtype=mx.int32)
+
+    def openclawrl_step(
+        self,
+        rows: Sequence[DistillationRow],
+        *,
+        w_rl: float,
+        w_opd: float,
+        eps_lo: float,
+        eps_hi: float,
+        diff_clip: float | None,
+        hint_selection: str,
+        native_k: int,
+    ) -> dict[str, Any]:
+        """One OpenClaw-RL step: the reward term plus the distillation term.
+
+        The reward term is a clipped surrogate on the tokens the policy
+        sampled, carrying the turn's single accept/reject bit. The
+        distillation term puts a teacher-weighted advantage on every candidate
+        the policy considered. Both reduce as the reference does — the mean
+        over a sample's response tokens, summed across samples — and combine
+        as ``w_rl * reward + w_opd * distillation``.
+        """
+        return self._run(
+            lambda: self._openclawrl_step(
+                rows,
+                w_rl=w_rl,
+                w_opd=w_opd,
+                eps_lo=eps_lo,
+                eps_hi=eps_hi,
+                diff_clip=diff_clip,
+                hint_selection=hint_selection,
+                native_k=native_k,
+            )
+        )
+
+    def _openclawrl_step(
+        self,
+        rows: Sequence[DistillationRow],
+        *,
+        w_rl: float,
+        w_opd: float,
+        eps_lo: float,
+        eps_hi: float,
+        diff_clip: float | None,
+        hint_selection: str,
+        native_k: int,
+    ) -> dict[str, Any]:
+        if not rows:
+            raise MLXEngineError("a training step requires at least one row")
+        if w_rl == 0.0 and w_opd == 0.0:
+            # Both terms off is not a no-op: the optimizer still runs, and
+            # AdamW decays the adapter on a zero gradient. A step that only
+            # shrinks the weights it was asked not to train is worth refusing.
+            raise MLXEngineError("openclawrl needs a non-zero w_rl or w_opd; both zero only decays the adapter")
+
+        weights = _ObjectiveWeights(w_rl, w_opd, eps_lo, eps_hi, diff_clip)
+        accumulated: dict[str, mx.array] | None = None
+        total_loss = 0.0
+        response_tokens = 0
+
+        for row in rows:
+            student_indices = mx.array([list(candidates) for candidates in row.topk_indices])
+            teacher_gathered, teacher_native = self._teacher_rows(row, native_k)
+            chosen = self._select_hint(teacher_native, student_indices, hint_selection)
+            # The selection is constant over a response today, so one index
+            # picks the hint rather than a per-token gather.
+            teacher_log_probs = teacher_gathered[_as_int(chosen[0])]
+
+            loss, flat = self._row_gradients(row, student_indices, teacher_log_probs, weights)
+            accumulated = flat if accumulated is None else {n: accumulated[n] + g for n, g in flat.items()}
+            total_loss += loss
+            response_tokens += len(row.loss_mask)
+
+        if accumulated is None:
+            raise MLXEngineError("training step produced no gradients")
+        self._optimizer.update(self._model, tree_unflatten(list(accumulated.items())))
+        mx.eval(self._model.parameters(), self._optimizer.state)
+        return {
+            "loss": total_loss,
+            "rows": len(rows),
+            "response_tokens": response_tokens,
+            "optimizer_step": _as_int(self._optimizer.step),
+            "w_rl": w_rl,
+            "w_opd": w_opd,
+        }
+
+    def _row_gradients(
+        self,
+        row: DistillationRow,
+        student_indices: mx.array,
+        teacher_log_probs: mx.array,
+        weights: _ObjectiveWeights,
+    ) -> tuple[float, dict[str, mx.array]]:
+        """Loss and gradients for one judged turn.
+
+        The reward term carries the turn's single accept/reject bit on the
+        tokens the policy sampled; the distillation term carries the teacher's
+        preference on every candidate it considered.
+        """
+        from reef.train.mlx_backend.objective import candidate_log_probs, opd_one_sample, policy_loss
+
+        response_length = len(row.loss_mask)
+        student_captured = mx.array([list(values) for values in row.topk_log_probs])
+        mask = mx.array([float(value) for value in row.loss_mask])
+        reward = float(row.reward)
+
+        def loss_fn(model: nn.Module) -> mx.array:
+            logits = self._response_logits_of(model, row.tokens, response_length)
+            total = mx.zeros((), dtype=mx.float32)
+            if weights.w_rl != 0.0:
+                sampled = self._sampled_log_probs(logits, row, response_length)
+                # The old actor is this actor: one optimizer step per rollout,
+                # so the ratio starts at 1 and the surrogate sits at its
+                # unclipped linear point.
+                ppo_kl = mx.clip(mx.stop_gradient(sampled) - sampled, -20.0, 20.0)
+                advantages = mx.full(sampled.shape, reward, dtype=mx.float32)
+                per_token, _ = policy_loss(ppo_kl, advantages, weights.eps_lo, weights.eps_hi)
+                total = total + weights.w_rl * self._sample_mean(per_token, mask)
+            if weights.w_opd != 0.0:
+                result = opd_one_sample(
+                    candidate_log_probs(logits, student_indices),
+                    student_indices=student_indices,
+                    student_captured_log_probs=student_captured,
+                    # subset_mode="student": the teacher was gathered at the
+                    # student's own candidates, so the sets coincide.
+                    teacher_indices=student_indices,
+                    teacher_log_probs=teacher_log_probs,
+                    eps_lo=weights.eps_lo,
+                    eps_hi=weights.eps_hi,
+                    diff_clip=weights.diff_clip,
+                )
+                total = total + weights.w_opd * self._sample_mean(result.per_token_pg, mask)
+            return total
+
+        loss, grads = nn.value_and_grad(self._model, loss_fn)(self._model)
+        mx.eval(loss, grads)
+        return _as_float(loss), dict(_flat(grads))
+
+    @staticmethod
+    def _sample_mean(per_token: mx.array, mask: mx.array) -> mx.array:
+        """The reference's reduction: a sample's mean over its response tokens."""
+        return mx.sum(per_token * mask) / mx.maximum(mx.sum(mask), mx.array(1.0))
+
+    def _response_logits_of(self, model: nn.Module, tokens: Sequence[int], response_length: int) -> mx.array:
+        sequence = mx.array([list(tokens)])
+        logits = model(sequence[:, :-1])
+        start = len(tokens) - response_length - 1
+        return logits[0, start : start + response_length]
+
+    @staticmethod
+    def _sampled_log_probs(logits: mx.array, row: DistillationRow, response_length: int) -> mx.array:
+        """Log-probs of the tokens the policy actually emitted."""
+        sampled = mx.array(list(row.tokens[-response_length:]))[:, None]
+        gathered = mx.take_along_axis(logits, sampled, axis=-1)[:, 0]
+        return gathered - mx.logsumexp(logits, axis=-1)
+
     # ---------------------------------------------------------------- adapter
 
     def adapter_snapshot(self) -> dict[str, mx.array]:
@@ -720,9 +1015,11 @@ __all__ = [
     "ADAPTER_CONFIG",
     "ADAPTER_WEIGHTS",
     "PROVENANCE",
+    "DistillationRow",
     "MLXEngine",
     "MLXEngineConfig",
     "MLXEngineError",
     "Rollout",
+    "TeacherCandidate",
     "TrainingRow",
 ]
