@@ -369,3 +369,77 @@ def test_an_unimplemented_hint_selection_is_refused() -> None:
             )
     finally:
         engine.close()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("float32", [True, False], ids=["float32", "float16"])
+def test_a_cached_prompt_scores_the_response_the_same_way(float32) -> None:
+    # Prefilling exists to bound memory, not to change the answer. In float32
+    # the two paths agree to 6e-05, which says the decomposition is exact; in
+    # float16 they separate by a few hundredths of a log-prob, which is the
+    # accumulation order of chunked attention and nothing else. Both bounds
+    # are asserted so a real divergence cannot hide behind the looser one.
+    import numpy
+
+    from reef.train.mlx_backend.engine import MLXEngine, MLXEngineConfig
+
+    tokens = tuple(100 + (index * 7) % 9000 for index in range(600))
+    response_length = 32
+
+    def log_probs(prefill: int):
+        engine = MLXEngine(
+            MLXEngineConfig(
+                model_path="mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+                lora_layers=4,
+                # q_proj only: a cached prompt is exact exactly when the
+                # adapter leaves keys and values alone.
+                lora_keys=("self_attn.q_proj",),
+                prefill_step_size=prefill,
+                seed=0,
+            )
+        )
+        try:
+            if float32:
+                engine._run(lambda: engine._model.set_dtype(mx.float32))
+
+            def run():
+                cache = engine._prefill(engine._model, tokens, response_length)
+                logits = engine._response_logits_of(engine._model, tokens, response_length, cache)
+                return numpy.array(logits - mx.logsumexp(logits, axis=-1, keepdims=True))
+
+            return engine._run(run)
+        finally:
+            engine.close()
+
+    whole = log_probs(0)
+    cached = log_probs(128)
+
+    assert whole.shape == cached.shape == (response_length, whole.shape[-1])
+    numpy.testing.assert_allclose(cached, whole, atol=1e-3 if float32 else 0.1)
+
+
+@pytest.mark.unit
+def test_a_cached_prompt_is_refused_when_the_adapter_reaches_keys_or_values() -> None:
+    # The cache would then be a function of the weights being trained, and
+    # freezing it drops that part of the gradient without saying so.
+    from reef.train.mlx_backend.engine import MLXEngineConfig
+
+    with pytest.raises(ValueError, match="leaves keys"):
+        MLXEngineConfig(
+            model_path="fake/model",
+            lora_keys=("self_attn.q_proj", "self_attn.v_proj"),
+            prefill_step_size=2048,
+        )
+
+
+@pytest.mark.unit
+def test_a_cached_prompt_is_allowed_when_only_queries_are_adapted() -> None:
+    from reef.train.mlx_backend.engine import MLXEngineConfig
+
+    config = MLXEngineConfig(
+        model_path="fake/model",
+        lora_keys=("self_attn.q_proj", "self_attn.o_proj"),
+        prefill_step_size=2048,
+    )
+
+    assert config.prefill_step_size == 2048

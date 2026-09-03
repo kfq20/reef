@@ -311,6 +311,10 @@ class MLXRuntime(TrainingRuntime):
                 provenance_extra={
                     "scenario_step": scenario_step,
                     "training_job_id": candidate_id,
+                    # The objective is whichever family actually trained these
+                    # weights, not a constant: an adapter that misnames how it
+                    # was produced cannot be reasoned about later.
+                    "objective": payload.get("loss_family"),
                     "loss_family": payload.get("loss_family"),
                     "source_runtime_load_id": current,
                 },
@@ -497,6 +501,7 @@ class MLXRuntimeFactory(RuntimeFactory):
             seed=int(config.get("seed", 0)),
             micro_batch_size=int(config.get("micro_batch_size", 8)),
             log_probs_chunk_size=int(config.get("log_probs_chunk_size", 0)),
+            prefill_step_size=int(config.get("prefill_step_size", 0)),
         )
         timeout = config.get("inference_timeout_s")
         return MLXRuntime(

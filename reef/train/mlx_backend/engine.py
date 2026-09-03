@@ -75,6 +75,13 @@ class MLXEngineConfig:
     #: it has to be captured while generating — it cannot be recovered later.
     #: Zero records nothing, which is what a purely on-policy objective wants.
     capture_topk: int = 0
+    #: Prompt tokens fed per pass when filling the attention cache. A bare
+    #: forward over the whole sequence builds a ``[heads, length, length]``
+    #: attention tensor — 206 GB at 65k tokens with 24 heads — which no
+    #: chunking of the output head can avoid. Prefilling in slices keeps that
+    #: to ``[heads, slice, length]``. Zero forwards the sequence whole, which
+    #: is faster for the short rows where it fits.
+    prefill_step_size: int = 0
     #: Target positions scored per pass over the output head. The logits
     #: tensor is ``[micro_batch, chunk, vocab]``, and at a 250k vocabulary
     #: that single tensor is what decides whether a long sequence trains at
@@ -95,6 +102,20 @@ class MLXEngineConfig:
             raise ValueError("temperature must be positive")
         if not self.lora_keys:
             raise ValueError("lora_keys must name at least one projection")
+        if self.prefill_step_size < 0 or isinstance(self.prefill_step_size, bool):
+            raise ValueError("prefill_step_size must be a non-negative integer")
+        if self.prefill_step_size and _lora_reaches_keys_or_values(self.lora_keys):
+            # Prefilling is exact only while the cached tensors are constant
+            # with respect to the trained weights. An adapted key or value
+            # projection makes the prompt's cache a function of those weights,
+            # so freezing it would drop that part of the gradient silently.
+            # Queries are safe: a prompt position's query never reaches a
+            # response position's output.
+            raise ValueError(
+                "prefill_step_size caches the prompt, which is exact only when the adapter leaves keys "
+                f"and values alone; lora_keys={list(self.lora_keys)} adapts them. Adapt q_proj (and o_proj "
+                "or the MLP) for long prompts, or set prefill_step_size to 0."
+            )
 
 
 @dataclass(frozen=True)
@@ -270,6 +291,18 @@ def _head_holder(model: nn.Module) -> Any:
             return node
         node = getattr(node, "language_model", None)
     return None
+
+
+def _lora_reaches_keys_or_values(lora_keys: Sequence[str]) -> bool:
+    """Whether the adapter changes what earlier positions contribute.
+
+    Caching a prompt is exact only when the cached tensors do not depend on
+    the trained parameters. Queries are safe — a prompt position's query never
+    reaches a response position's output — but adapted keys or values make the
+    cache a function of the weights being trained, and freezing it then drops
+    a real part of the gradient.
+    """
+    return any("k_proj" in key or "v_proj" in key for key in lora_keys)
 
 
 def _head_logits(holder: Any, hidden: mx.array) -> mx.array:
@@ -534,17 +567,8 @@ class MLXEngine:
     # ---------------------------------------------------- distillation (OPD)
 
     def _response_logits(self, tokens: Sequence[int], response_length: int) -> mx.array:
-        """Logits on the target positions that predict the response tokens.
-
-        Response token ``j`` is predicted from target position
-        ``prompt_length - 1 + j``, so this slice lines up with the captured
-        candidates whatever the prompt length is — which matters because the
-        teacher's prompt is longer than the student's by the hint.
-        """
-        sequence = mx.array([list(tokens)])
-        logits = self._model(sequence[:, :-1])
-        start = len(tokens) - response_length - 1
-        return logits[0, start : start + response_length]
+        """Logits on the target positions that predict the response tokens."""
+        return self._response_logits_of(self._model, tokens, response_length)
 
     def _teacher_candidate(
         self,
@@ -559,7 +583,10 @@ class MLXEngine:
         decided by how far the teacher's own preferred tokens overlap the
         policy's, so both have to come out of the same forward.
         """
-        logits = self._response_logits(candidate.tokens, response_length)
+        # The teacher runs forward only, so a cached prompt costs it nothing
+        # in fidelity: there is no gradient to lose.
+        cache = self._prefill(self._model, candidate.tokens, response_length)
+        logits = self._response_logits_of(self._model, candidate.tokens, response_length, cache)
         log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         at_student = mx.take_along_axis(log_probs, student_indices, axis=-1)
         native = mx.argpartition(-log_probs, kth=native_k - 1, axis=-1)[:, :native_k]
@@ -721,8 +748,15 @@ class MLXEngine:
         mask = mx.array([float(value) for value in row.loss_mask])
         reward = float(row.reward)
 
+        # The prompt is cached outside the traced function, so the gradient
+        # covers the response positions only. That is the whole gradient here:
+        # the config refuses a cached prefill unless the adapter leaves keys
+        # and values alone, and an unadapted prompt cache is constant with
+        # respect to the weights being trained.
+        cache = self._prefill(self._model, row.tokens, response_length)
+
         def loss_fn(model: nn.Module) -> mx.array:
-            logits = self._response_logits_of(model, row.tokens, response_length)
+            logits = self._response_logits_of(model, row.tokens, response_length, cache)
             total = mx.zeros((), dtype=mx.float32)
             if weights.w_rl != 0.0:
                 sampled = self._sampled_log_probs(logits, row, response_length)
@@ -758,11 +792,67 @@ class MLXEngine:
         """The reference's reduction: a sample's mean over its response tokens."""
         return mx.sum(per_token * mask) / mx.maximum(mx.sum(mask), mx.array(1.0))
 
-    def _response_logits_of(self, model: nn.Module, tokens: Sequence[int], response_length: int) -> mx.array:
-        sequence = mx.array([list(tokens)])
-        logits = model(sequence[:, :-1])
+    def _prefill(self, model: nn.Module, tokens: Sequence[int], response_length: int) -> Any:
+        """Fill an attention cache with the prompt, a slice at a time.
+
+        Returns ``None`` when prefilling is switched off or the prompt is
+        shorter than one slice, in which case the caller forwards the sequence
+        whole. Each slice is evaluated before the next, so the intermediate
+        graph is released rather than accumulated.
+        """
+        step = self._config.prefill_step_size
+        prompt_length = len(tokens) - response_length - 1
+        if not step or prompt_length <= step:
+            return None
+        holder = _head_holder(model)
+        if holder is None:
+            return None
+        from mlx_lm.models.cache import make_prompt_cache
+
+        cache = make_prompt_cache(holder)
+        for offset in range(0, prompt_length, step):
+            chunk = mx.array([list(tokens[offset : min(offset + step, prompt_length)])])
+            holder.model(chunk, cache=cache)
+            mx.eval([entry.state for entry in cache])
+        return cache
+
+    def _response_logits_of(
+        self,
+        model: nn.Module,
+        tokens: Sequence[int],
+        response_length: int,
+        cache: Any = None,
+    ) -> mx.array:
+        """Logits for the target positions that predict the response tokens.
+
+        Response token ``j`` is predicted from target position
+        ``prompt_length - 1 + j``, so this slice lines up with the captured
+        candidates whatever the prompt length is — which matters because the
+        teacher's prompt is longer than the student's by its hint.
+
+        The hidden states are sliced *before* the output head. That is what
+        makes a long prompt affordable: the head is the only part of the model
+        whose activation is vocabulary-sized, so projecting the whole context
+        would cost ``[context, vocab]`` — 130 GB at a 130k prompt and a 250k
+        vocabulary — for a result of which only the response rows are ever
+        read. The body still runs over the whole context, because the response
+        attends to all of it.
+        """
         start = len(tokens) - response_length - 1
-        return logits[0, start : start + response_length]
+        holder = _head_holder(model)
+        if holder is None:
+            # An architecture whose body and head cannot be told apart: fall
+            # back to projecting everything, which is correct but costly.
+            sequence = mx.array([list(tokens)])
+            return model(sequence[:, :-1])[0, start : start + response_length]
+        if cache is not None:
+            # The prompt is already in the cache; only the response positions
+            # still have to run, and their attention reaches back through it.
+            tail = mx.array([list(tokens[start : len(tokens) - 1])])
+            return _head_logits(holder, holder.model(tail, cache=cache))[0]
+        sequence = mx.array([list(tokens)])
+        hidden = holder.model(sequence[:, :-1])
+        return _head_logits(holder, hidden[:, start : start + response_length])[0]
 
     @staticmethod
     def _sampled_log_probs(logits: mx.array, row: DistillationRow, response_length: int) -> mx.array:
@@ -936,7 +1026,6 @@ class MLXEngine:
             "lora_parameters": self._lora_parameters(),
             "libraries": versions,
             "rollout": "in-process mlx-lm generate_step",
-            "objective": "tttd-importance-sampling",
         }
         if extra:
             record.update(extra)
