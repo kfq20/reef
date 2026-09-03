@@ -1,0 +1,124 @@
+"""The chunked log-prob path must compute the same gradients as the whole one.
+
+Chunking exists to keep the ``[batch, length, vocab]`` logits tensor from
+being materialised, which is what decides whether a long sequence trains at
+all. It is only a memory optimisation if it is also numerically the same
+optimisation, so this pins the equivalence rather than trusting it.
+
+Needs real MLX and a real model, so it skips everywhere except Apple Silicon
+with the optional extra installed. The runtime's own contract tests
+(``test_mlx_runtime.py``) run everywhere.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+mx = pytest.importorskip("mlx.core", reason="the MLX engine needs the optional mlx extra")
+pytest.importorskip("mlx_lm", reason="the MLX engine needs the optional mlx extra")
+
+from reef.train.mlx_backend.engine import (
+    MLXEngine,
+    MLXEngineConfig,
+    TrainingRow,
+    _head_holder,
+    _head_logits,
+)
+
+#: Small enough to load quickly, real enough to exercise a genuine head.
+MODEL = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+LENGTH = 192
+RESPONSE = 160
+
+
+def rows() -> list[TrainingRow]:
+    # Advantages of opposing sign on purpose: the objective is a sum over
+    # tokens that cancels heavily, which is the regime where a sloppy
+    # reduction shows up.
+    return [
+        TrainingRow(
+            tokens=tuple((index * 7 + position) % 9000 + 100 for position in range(LENGTH)),
+            loss_mask=(1,) * RESPONSE,
+            rollout_log_probs=tuple(-0.5 - 0.001 * position for position in range(RESPONSE)),
+            advantages=tuple(1.0 if index % 2 else -0.7 for _ in range(RESPONSE)),
+        )
+        for index in range(2)
+    ]
+
+
+def gradients(chunk: int, *, float32: bool):
+    engine = MLXEngine(
+        MLXEngineConfig(
+            model_path=MODEL,
+            lora_layers=4,
+            lora_rank=8,
+            micro_batch_size=2,
+            log_probs_chunk_size=chunk,
+            seed=0,
+        )
+    )
+    try:
+        if float32:
+            engine._run(lambda: engine._model.set_dtype(mx.float32))
+        loss, grads = engine._run(lambda: engine._micro_batch_gradients(engine._pack(rows())))
+        return loss, {name: mx.array(value).astype(mx.float32) for name, value in grads.items()}
+    finally:
+        engine.close()
+
+
+def worst_relative_deviation(reference, candidate) -> float:
+    worst = 0.0
+    for name, expected in reference.items():
+        scale = mx.maximum(mx.max(mx.abs(expected)), mx.array(1e-12))
+        deviation = float((mx.max(mx.abs(expected - candidate[name])) / scale).item())
+        worst = max(worst, deviation)
+    return worst
+
+
+@pytest.mark.integration
+def test_the_head_split_reproduces_the_model_logits_exactly() -> None:
+    # Chunked scoring runs the body and the head separately. If that split is
+    # not exact, every number below is measuring the wrong thing.
+    engine = MLXEngine(MLXEngineConfig(model_path=MODEL, lora_layers=4, seed=0))
+    try:
+
+        def probe() -> float:
+            holder = _head_holder(engine._model)
+            tokens = mx.array([[101, 202, 303, 404, 505]])
+            whole = engine._model(tokens)
+            split = _head_logits(holder, holder.model(tokens))
+            mx.eval(whole, split)
+            return float(mx.max(mx.abs(whole - split)).item())
+
+        assert engine._run(probe) == 0.0
+    finally:
+        engine.close()
+
+
+@pytest.mark.integration
+def test_chunked_gradients_match_the_whole_sequence_in_float32() -> None:
+    # float32 removes the reduced-precision noise, leaving only whether the
+    # chunked decomposition is the same mathematics.
+    reference_loss, reference = gradients(0, float32=True)
+    chunked_loss, chunked = gradients(64, float32=True)
+
+    assert abs(reference_loss - chunked_loss) / abs(reference_loss) < 1e-3
+    assert worst_relative_deviation(reference, chunked) < 1e-3
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("chunk", [32, 64, 128])
+def test_chunking_adds_no_meaningful_error_in_float16(chunk: int) -> None:
+    # The model serves in float16, so the useful question is not whether the
+    # two paths agree with each other — neither is exact — but whether
+    # chunking makes the answer worse. Measured against the float32 reference
+    # both sit around 4e-2, so the bound below is deliberately tight: it
+    # fails if chunking ever becomes materially less accurate, while
+    # tolerating the slice-boundary rounding it legitimately introduces.
+    _, reference = gradients(0, float32=True)
+    _, whole = gradients(0, float32=False)
+    _, chunked = gradients(chunk, float32=False)
+
+    whole_error = worst_relative_deviation(reference, whole)
+    chunked_error = worst_relative_deviation(reference, chunked)
+    assert chunked_error <= max(whole_error * 1.5, 1e-3)

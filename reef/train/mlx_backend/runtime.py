@@ -416,6 +416,7 @@ class MLXRuntimeFactory(RuntimeFactory):
             top_p=float(config.get("top_p", 1.0)),
             seed=int(config.get("seed", 0)),
             micro_batch_size=int(config.get("micro_batch_size", 8)),
+            log_probs_chunk_size=int(config.get("log_probs_chunk_size", 0)),
         )
         timeout = config.get("inference_timeout_s")
         return MLXRuntime(

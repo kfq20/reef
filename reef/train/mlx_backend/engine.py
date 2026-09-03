@@ -70,6 +70,12 @@ class MLXEngineConfig:
     #: exhausts unified memory; the step then accumulates over several
     #: micro-batches instead of failing.
     micro_batch_size: int = 8
+    #: Target positions scored per pass over the output head. The logits
+    #: tensor is ``[micro_batch, chunk, vocab]``, and at a 250k vocabulary
+    #: that single tensor is what decides whether a long sequence trains at
+    #: all: 16k positions in one pass is 16 GB, in 1k chunks it is 1 GB. Zero
+    #: scores the whole sequence at once, which is fastest for short rows.
+    log_probs_chunk_size: int = 0
 
     def __post_init__(self) -> None:
         if not self.model_path:
@@ -181,6 +187,32 @@ def _token_log_probs(model: nn.Module, sequences: mx.array, mask: mx.array) -> m
     return -nn.losses.cross_entropy(logits, targets, reduction="none") * mask
 
 
+def _head_holder(model: nn.Module) -> Any:
+    """The module that owns the body and the output head, or None.
+
+    mlx-lm models are consistently a body producing hidden states plus a head
+    projecting them to the vocabulary, but the owner is the model itself for a
+    plain text model and a nested ``language_model`` for one converted from a
+    VLM checkpoint. Chunked scoring needs the two halves separately; when the
+    shape is not recognised the caller scores the whole sequence instead.
+    """
+    node: Any = model
+    for _ in range(4):
+        if node is None:
+            return None
+        if hasattr(node, "model") and hasattr(node.model, "layers"):
+            return node
+        node = getattr(node, "language_model", None)
+    return None
+
+
+def _head_logits(holder: Any, hidden: mx.array) -> mx.array:
+    """Project hidden states to vocabulary logits, tied or untied."""
+    if hasattr(holder, "lm_head"):
+        return holder.lm_head(hidden)
+    return holder.model.embed_tokens.as_linear(hidden)
+
+
 def _response_mask(prompt_lengths: mx.array, sequence_lengths: mx.array, width: int) -> mx.array:
     """1 on target positions holding a response token, 0 elsewhere.
 
@@ -218,6 +250,7 @@ class MLXEngine:
         self._model.freeze()
         linear_to_lora_layers(self._model, self._config.lora_layers, self._lora_parameters())
         self._optimizer = optim.AdamW(learning_rate=self._config.learning_rate)
+        self._holder = _head_holder(self._model)
 
     def _run(self, work: Callable[[], Any]) -> Any:
         """Execute ``work`` on the engine thread and re-raise what it raises."""
@@ -423,19 +456,105 @@ class MLXEngine:
     def adapter_snapshot(self) -> dict[str, mx.array]:
         return self._run(self._adapter_snapshot)
 
+    @staticmethod
+    def _surrogate(
+        log_probs: mx.array,
+        rollout_log_probs: mx.array,
+        advantages: mx.array,
+        mask: mx.array,
+    ) -> mx.array:
+        """TTT-Discover's un-clipped importance-sampling surrogate.
+
+        ``-exp(logpi_theta - logpi_rollout) * advantage``, summed over response
+        tokens. Both gradient paths call this, so a chunked step and a
+        whole-sequence step optimise the same objective by construction.
+
+        The reduction is float32 even though the model runs in float16. This
+        is a sum of thousands of same-magnitude terms whose signs follow the
+        advantages, so it cancels heavily; accumulating it in float16 loses
+        precision the gradient then inherits.
+        """
+        ratio = mx.exp(log_probs.astype(mx.float32) - rollout_log_probs.astype(mx.float32)) * mask
+        return (-ratio * advantages * mask).astype(mx.float32).sum()
+
     def _micro_batch_gradients(self, tensors: _StepTensors) -> tuple[float, dict[str, mx.array]]:
         """Loss and gradients for one micro-batch of the TTT-Discover objective."""
+        chunk = self._config.log_probs_chunk_size
+        if chunk and self._holder is not None and tensors.mask.shape[1] > chunk:
+            return self._chunked_gradients(tensors, chunk)
 
         def loss_fn(model: nn.Module) -> mx.array:
             log_probs = _token_log_probs(model, tensors.sequences, tensors.mask)
             # rollout_log_probs is already laid out on target positions, so
             # no shift is needed here.
-            ratio = mx.exp(log_probs - tensors.rollout_log_probs) * tensors.mask
-            return (-ratio * tensors.advantages * tensors.mask).sum()
+            return self._surrogate(log_probs, tensors.rollout_log_probs, tensors.advantages, tensors.mask)
 
         loss, grads = nn.value_and_grad(self._model, loss_fn)(self._model)
         mx.eval(loss, grads)
         return _as_float(loss), dict(_flat(grads))
+
+    def _chunked_gradients(self, tensors: _StepTensors, chunk: int) -> tuple[float, dict[str, mx.array]]:
+        """The same gradients, without ever holding the full logits tensor.
+
+        Three passes instead of one. The body runs first to produce hidden
+        states, which are ``vocab / hidden`` times smaller than logits — about
+        50x here. The loss is then scored over slices of those hidden states,
+        each slice yielding its own gradient with respect to the hidden states
+        and nothing larger than ``[batch, chunk, vocab]`` existing at a time.
+        Because the objective is a plain sum over tokens, concatenating those
+        slice gradients gives exactly the gradient the whole-sequence path
+        would produce. A final vector-Jacobian product carries that cotangent
+        back through the body into the adapter parameters.
+        """
+        holder = self._holder
+        inputs = tensors.sequences[:, :-1]
+        targets = tensors.sequences[:, 1:]
+
+        hidden = holder.model(inputs)
+        mx.eval(hidden)
+
+        total_loss = mx.zeros((), dtype=mx.float32)
+        cotangents = []
+        for start in range(0, hidden.shape[1], chunk):
+            stop = min(start + chunk, hidden.shape[1])
+            target_slice = targets[:, start:stop]
+            mask_slice = tensors.mask[:, start:stop]
+            rollout_slice = tensors.rollout_log_probs[:, start:stop]
+            advantage_slice = tensors.advantages[:, start:stop]
+
+            def slice_loss(
+                hidden_slice: mx.array,
+                target_slice: mx.array = target_slice,
+                mask_slice: mx.array = mask_slice,
+                rollout_slice: mx.array = rollout_slice,
+                advantage_slice: mx.array = advantage_slice,
+            ) -> mx.array:
+                logits = _head_logits(holder, hidden_slice)
+                log_probs = -nn.losses.cross_entropy(logits, target_slice, reduction="none") * mask_slice
+                return self._surrogate(log_probs, rollout_slice, advantage_slice, mask_slice)
+
+            loss_slice, (cotangent,) = mx.vjp(slice_loss, [hidden[:, start:stop]], [mx.array(1.0)])
+            mx.eval(loss_slice, cotangent)
+            total_loss = total_loss + loss_slice[0].astype(mx.float32)
+            cotangents.append(cotangent)
+
+        # One backward through the body, seeded with the assembled cotangent.
+        # Only parameters on a path to a trainable weight receive a gradient,
+        # so a frozen prefix costs nothing here.
+        seed = mx.concatenate(cotangents, axis=1)
+
+        # mx.vjp differentiates a function of a flat list of arrays, so the
+        # parameter tree is flattened here and rebuilt inside.
+        trainable = _flat(self._model.trainable_parameters())
+        names = [name for name, _ in trainable]
+
+        def body(*params: mx.array) -> mx.array:
+            self._model.update(tree_unflatten(list(zip(names, params, strict=True))))
+            return holder.model(inputs)
+
+        _, gradients = mx.vjp(body, [value for _, value in trainable], [seed])
+        mx.eval(gradients)
+        return _as_float(total_loss), dict(zip(names, gradients, strict=True))
 
     def _adapter_snapshot(self) -> dict[str, mx.array]:
         return {name: mx.array(value) for name, value in _flat(self._model.trainable_parameters())}
