@@ -99,6 +99,18 @@ class MLXInferenceBackend(InferenceBackend):
                 "prompt_length": len(prompt_tokens),
                 "response_length": len(output_tokens),
                 "runtime_load_id": runtime_load_id,
+                # Present only when the engine was asked to capture them. A
+                # distillation objective trains on the candidate set the
+                # policy actually considered, and nothing downstream can
+                # reconstruct it after generation.
+                **(
+                    {
+                        "topk_indices": [list(row) for row in rollout.topk_indices],
+                        "topk_log_probs": [list(row) for row in rollout.topk_log_probs],
+                    }
+                    if rollout.topk_indices
+                    else {}
+                ),
             },
         }
         if runtime_load_id is not None:

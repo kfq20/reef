@@ -360,3 +360,109 @@ def test_the_frozen_base_pass_runs_with_inference_closed(tmp_path: Path) -> None
     runtime.train_candidate(prepared.payload)
 
     assert observed == [False]
+
+
+class _FakeRollout:
+    """The engine's Rollout shape, without loading a model."""
+
+    def __init__(self, *, topk=True):
+        self.prompt_tokens = (11, 12, 13)
+        self.output_tokens = (21, 22)
+        self.rollout_log_probs = (-0.5, -0.25)
+        self.text = "an answer"
+        self.finish_reason = "stop"
+        self.topk_indices = ((21, 99), (22, 98)) if topk else ()
+        self.topk_log_probs = ((-0.5, -3.0), (-0.25, -4.0)) if topk else ()
+
+
+class _FakeEngineForServing:
+    def __init__(self, rollout):
+        self._rollout = rollout
+        self.config = FakeEngineConfig()
+        self.publications = 0
+
+    def next_runtime_load_id(self) -> str:
+        self.publications += 1
+        return f"fake-{self.publications}"
+
+    def render_prompt(self, messages):
+        return [11, 12, 13]
+
+    def generate(self, prompt_tokens, *, max_tokens=None, temperature=None):
+        return self._rollout
+
+
+def _serve(payload, *, topk=True):
+    import asyncio
+
+    from reef.artifact.artifact import Artifact
+    from reef.train.mlx_backend.inference import MLXInferenceBackend
+
+    runtime = MLXRuntime(
+        _FakeEngineForServing(_FakeRollout(topk=topk)),
+        checkpoint_dir="/tmp/reef-mlx-serving-test",
+    )
+    backend = MLXInferenceBackend(runtime)
+    return asyncio.run(backend.inference(Artifact.local(Path("/tmp")), "/v1/chat/completions", payload))
+
+
+@pytest.mark.unit
+def test_a_served_response_carries_the_tensors_that_make_it_trainable() -> None:
+    response = _serve({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8})
+    training = response["training"]
+
+    # Full sequence, mask over the response only: what policy_row_violation
+    # checks before a record can become a sample.
+    assert training["tokens"] == [11, 12, 13, 21, 22]
+    assert training["loss_mask"] == [1, 1]
+    assert training["rollout_log_probs"] == [-0.5, -0.25]
+    assert training["runtime_load_id"] == response["choices"][0]["meta_info"]["runtime_load_id"]
+
+
+@pytest.mark.unit
+def test_captured_candidates_reach_the_wire_when_the_engine_records_them() -> None:
+    # A distillation objective trains on the candidate set the policy
+    # considered; nothing downstream can rebuild it after generation.
+    training = _serve({"messages": [{"role": "user", "content": "hi"}]})["training"]
+
+    assert training["topk_indices"] == [[21, 99], [22, 98]]
+    assert training["topk_log_probs"] == [[-0.5, -3.0], [-0.25, -4.0]]
+
+
+@pytest.mark.unit
+def test_no_candidate_channel_when_capture_is_off() -> None:
+    # An on-policy objective needs none, and an absent key is what
+    # make_policy_sample reads as "not captured".
+    training = _serve({"messages": [{"role": "user", "content": "hi"}]}, topk=False)["training"]
+
+    assert "topk_indices" not in training
+    assert "topk_log_probs" not in training
+
+
+@pytest.mark.unit
+def test_streaming_is_refused_rather_than_faked() -> None:
+    from reef.runtime.inference import UpstreamStatusError
+
+    with pytest.raises(UpstreamStatusError, match="streaming"):
+        _serve({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+
+
+@pytest.mark.unit
+def test_an_empty_completion_is_refused_so_a_grid_cannot_stall() -> None:
+    from reef.runtime.inference import UpstreamStatusError
+
+    rollout = _FakeRollout()
+    rollout.output_tokens = ()
+    rollout.rollout_log_probs = ()
+    rollout.topk_indices = ()
+    rollout.topk_log_probs = ()
+
+    import asyncio
+
+    from reef.artifact.artifact import Artifact
+    from reef.train.mlx_backend.inference import MLXInferenceBackend
+
+    runtime = MLXRuntime(_FakeEngineForServing(rollout), checkpoint_dir="/tmp/reef-mlx-serving-test")
+    backend = MLXInferenceBackend(runtime)
+    with pytest.raises(UpstreamStatusError, match="no response tokens"):
+        asyncio.run(backend.inference(Artifact.local(Path("/tmp")), "/v1/chat/completions", {"messages": [{}]}))

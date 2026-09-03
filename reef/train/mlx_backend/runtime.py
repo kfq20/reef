@@ -410,6 +410,7 @@ class MLXRuntimeFactory(RuntimeFactory):
             lora_scale=float(config.get("lora_scale", 2.0)),
             lora_dropout=float(config.get("lora_dropout", 0.0)),
             lora_keys=tuple(config.get("lora_keys", ("self_attn.q_proj", "self_attn.v_proj"))),
+            capture_topk=int(config.get("capture_topk", 0)),
             learning_rate=float(config.get("learning_rate", 1e-5)),
             max_tokens=int(config.get("max_tokens", 256)),
             temperature=float(config.get("temperature", 1.0)),

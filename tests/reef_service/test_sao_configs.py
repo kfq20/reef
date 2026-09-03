@@ -352,6 +352,7 @@ def test_user_facing_example_deployments_are_discovered() -> None:
         "tutorials/evolve-your-harness/configs/serve.yaml",
         "recipes/sao/examples/sao/serve.yaml",
         "recipes/tttd/examples/tttd/serve.yaml",
+        "recipes/tttd/examples/tttd_mlx/serve.yaml",
     }
 
 

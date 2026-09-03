@@ -70,6 +70,11 @@ class MLXEngineConfig:
     #: exhausts unified memory; the step then accumulates over several
     #: micro-batches instead of failing.
     micro_batch_size: int = 8
+    #: Candidate vocabulary entries recorded per generated token. Distillation
+    #: objectives train on the distribution the policy actually considered, so
+    #: it has to be captured while generating — it cannot be recovered later.
+    #: Zero records nothing, which is what a purely on-policy objective wants.
+    capture_topk: int = 0
     #: Target positions scored per pass over the output head. The logits
     #: tensor is ``[micro_batch, chunk, vocab]``, and at a 250k vocabulary
     #: that single tensor is what decides whether a long sequence trains at
@@ -80,6 +85,8 @@ class MLXEngineConfig:
     def __post_init__(self) -> None:
         if not self.model_path:
             raise ValueError("model_path must be non-empty")
+        if isinstance(self.capture_topk, bool) or not isinstance(self.capture_topk, int) or self.capture_topk < 0:
+            raise ValueError("capture_topk must be a non-negative integer")
         for name in ("lora_layers", "lora_rank", "max_tokens", "micro_batch_size"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -99,6 +106,10 @@ class Rollout:
     rollout_log_probs: tuple[float, ...]
     text: str
     finish_reason: str
+    #: Per response token, the ids of the highest-probability candidates and
+    #: their log-probs. Empty unless ``capture_topk`` asked for them.
+    topk_indices: tuple[tuple[int, ...], ...] = ()
+    topk_log_probs: tuple[tuple[float, ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -322,8 +333,11 @@ class MLXEngine:
         prompt = mx.array(list(prompt_tokens))
         stop_ids = set(self._tokenizer.eos_token_ids)
 
+        capture = self._config.capture_topk
         output: list[int] = []
         log_probs: list[float] = []
+        topk_indices: list[tuple[int, ...]] = []
+        topk_log_probs: list[tuple[float, ...]] = []
         finish_reason = "length"
         for token, step_log_probs in generate_step(prompt, self._model, max_tokens=limit, sampler=sampler):
             # mlx-lm yields a plain int here; older versions yield a 0-d array.
@@ -332,7 +346,16 @@ class MLXEngine:
                 finish_reason = "stop"
                 break
             chosen = step_log_probs[token_id]
-            mx.eval(chosen)
+            if capture:
+                # argpartition is enough: the objective works on a candidate
+                # set, and never needs it ordered.
+                candidates = mx.argpartition(-step_log_probs, kth=capture - 1)[:capture]
+                values = step_log_probs[candidates]
+                mx.eval(chosen, candidates, values)
+                topk_indices.append(tuple(_as_int(value) for value in candidates))
+                topk_log_probs.append(tuple(_as_float(value) for value in values))
+            else:
+                mx.eval(chosen)
             output.append(token_id)
             log_probs.append(_as_float(chosen))
         return Rollout(
@@ -341,6 +364,8 @@ class MLXEngine:
             rollout_log_probs=tuple(log_probs),
             text=self._tokenizer.decode(output),
             finish_reason=finish_reason,
+            topk_indices=tuple(topk_indices),
+            topk_log_probs=tuple(topk_log_probs),
         )
 
     # --------------------------------------------------------------- training
