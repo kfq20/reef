@@ -127,6 +127,50 @@ the new one, never a half-written one.
   refuses `max_staleness > 0` rather than pretending to correct for it.
 - **Single scenario.** Per-scenario adapter slots are not implemented here.
 
+## How large a model fits
+
+Measured on an M4 Pro with 51.5 GB of unified memory. MLX reports a 40.2 GB
+`max_recommended_working_set_size`, but that is a soft wiring hint: a step
+peaking at 44.9 GB still ran with linear timing, while one asking for 71 GB
+took 4.5x longer than the trend — the real cliff is physical RAM.
+
+Weights and generation, 4-bit, LoRA rank 8:
+
+| model | weights | generation |
+| --- | --- | --- |
+| Qwen2.5-1.5B | 0.87 GB | 130 tok/s |
+| Qwen2.5-7B | 4.29 GB | 53 tok/s |
+| Qwen3.8-27B | 15.13 GB | ~14 tok/s |
+| Qwen2.5-32B | 18.43 GB | 11.5 tok/s |
+| Llama-3.3-70B | 39.69 GB | 4.0 tok/s |
+
+Everything above trains. 70B does so with `micro_batch_size: 1` and no
+headroom, so treat it as the ceiling rather than a working configuration.
+
+Training peak scales with `micro_batch_size x sequence length`, at roughly
+3-5 MB per (sequence x token) — not with model size beyond the weights. Two
+sweeps, both one sequence per backward:
+
+| tokens | Qwen2.5-32B | Qwen3.8-27B | Qwen3.8-27B, chunk 1024 |
+| --- | --- | --- | --- |
+| 1024 | 22.95 GB | 17.58 GB | — |
+| 2048 | 28.80 GB | 20.13 GB | — |
+| 4096 | 44.35 GB | 25.40 GB | 20.72 GB |
+| 8192 | — | 37.31 GB | 27.25 GB |
+| 16384 | — | 58.15 GB | 58.82 GB |
+
+`log_probs_chunk_size` removes the `[batch, length, vocab]` logits tensor and
+is worth 27% of peak memory at 8192 tokens, for about 40% more time. It buys
+nothing at 16384: past roughly 8k the body's own forward graph dominates, so
+that length needs a frozen-prefix or gradient-checkpointing change rather than
+a smaller chunk.
+
+Long-context *serving* is a different and much easier problem, because the
+hybrid architectures keep a KV cache on only a quarter of their blocks:
+Qwen3.8-27B prefilled 16384 tokens at 20.56 GB and 65536 at 28.65 GB. Prefill
+runs about 100-125 tok/s, which is the binding cost at those lengths, not
+memory.
+
 ## Tuning for your machine
 
 Unified memory scales with the number of sequences held in one backward pass
