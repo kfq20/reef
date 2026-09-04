@@ -54,6 +54,12 @@ class MLXInferenceBackend(InferenceBackend):
         template_kwargs = payload.get("chat_template_kwargs")
         if template_kwargs is not None and not isinstance(template_kwargs, Mapping):
             raise UpstreamStatusError("chat_template_kwargs must be an object", status=400)
+        # The toolset the caller declared. The chat template renders it into
+        # the prompt — the schemas and the call syntax the model is meant to
+        # answer in — so dropping it leaves the model inventing both.
+        tools = payload.get("tools")
+        if tools is not None and not isinstance(tools, list):
+            raise UpstreamStatusError("tools must be an array", status=400)
         async with self._lock:
             rollout = await asyncio.to_thread(
                 self._generate,
@@ -61,6 +67,7 @@ class MLXInferenceBackend(InferenceBackend):
                 None if max_tokens is None else int(max_tokens),
                 None if temperature is None else float(temperature),
                 template_kwargs,
+                tools,
             )
         if not rollout.output_tokens:
             # A completion with no response tokens can never be a policy
@@ -77,9 +84,10 @@ class MLXInferenceBackend(InferenceBackend):
         max_tokens: int | None,
         temperature: float | None,
         template_kwargs: Mapping[str, Any] | None = None,
+        tools: list[Any] | None = None,
     ) -> Any:
         engine = self._runtime.engine
-        prompt_tokens = engine.render_prompt(messages, template_kwargs=template_kwargs)
+        prompt_tokens = engine.render_prompt(messages, tools=tools, template_kwargs=template_kwargs)
         return engine.generate(prompt_tokens, max_tokens=max_tokens, temperature=temperature)
 
     def _response(self, request: Mapping[str, Any], rollout: Any) -> dict[str, Any]:

@@ -401,13 +401,15 @@ class _FakeEngineForServing:
         self.config = FakeEngineConfig()
         self.publications = 0
         self.template_kwargs = "unset"
+        self.tools = "unset"
 
     def next_runtime_load_id(self) -> str:
         self.publications += 1
         return f"fake-{self.publications}"
 
-    def render_prompt(self, messages, *, template_kwargs=None):
+    def render_prompt(self, messages, *, tools=None, template_kwargs=None):
         self.template_kwargs = template_kwargs
+        self.tools = tools
         return [11, 12, 13]
 
     def generate(self, prompt_tokens, *, max_tokens=None, temperature=None):
@@ -502,6 +504,55 @@ def test_a_request_without_template_kwargs_leaves_the_deployment_default() -> No
         )
     )
     assert engine.template_kwargs is None
+
+
+@pytest.mark.unit
+def test_a_declared_toolset_reaches_the_chat_template() -> None:
+    """The template renders the schemas *and* the one call syntax it parses
+    back. A request whose tools are dropped leaves the model guessing both."""
+    import asyncio
+
+    from reef.artifact.artifact import Artifact
+    from reef.train.mlx_backend.inference import MLXInferenceBackend
+
+    tools = [{"type": "function", "function": {"name": "read_file", "parameters": {}}}]
+    engine = _FakeEngineForServing(_FakeRollout())
+    backend = MLXInferenceBackend(MLXRuntime(engine, checkpoint_dir="/tmp/reef-mlx-tools-test"))
+    asyncio.run(
+        backend.inference(
+            Artifact.local(Path("/tmp")),
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hi"}], "tools": tools},
+        )
+    )
+    assert engine.tools == tools
+
+
+@pytest.mark.unit
+def test_a_request_without_tools_declares_none() -> None:
+    engine = _FakeEngineForServing(_FakeRollout())
+    import asyncio
+
+    from reef.artifact.artifact import Artifact
+    from reef.train.mlx_backend.inference import MLXInferenceBackend
+
+    backend = MLXInferenceBackend(MLXRuntime(engine, checkpoint_dir="/tmp/reef-mlx-tools-test"))
+    asyncio.run(
+        backend.inference(
+            Artifact.local(Path("/tmp")),
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hi"}]},
+        )
+    )
+    assert engine.tools is None
+
+
+@pytest.mark.unit
+def test_a_malformed_tools_field_is_refused() -> None:
+    from reef.runtime.inference import UpstreamStatusError
+
+    with pytest.raises(UpstreamStatusError, match="tools"):
+        _serve({"messages": [{"role": "user", "content": "hi"}], "tools": {"name": "read_file"}})
 
 
 @pytest.mark.unit

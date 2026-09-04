@@ -316,7 +316,15 @@ def _lora_reaches_keys_or_values(lora_keys: Sequence[str]) -> bool:
 #: Template arguments the engine owns. ``tokenize`` and ``add_generation_prompt``
 #: decide what a prompt *is*, so letting a caller set them would break the
 #: promise that the tokens which train are the tokens that were served.
-_RESERVED_TEMPLATE_KWARGS = ("tokenize", "add_generation_prompt", "conversation", "messages")
+_RESERVED_TEMPLATE_KWARGS = (
+    "tokenize",
+    "add_generation_prompt",
+    "conversation",
+    "messages",
+    # `tools` has its own request field; accepting it here too would let one
+    # request declare two different toolsets.
+    "tools",
+)
 
 
 def _reject_reserved_template_kwargs(template_kwargs: Mapping[str, Any]) -> None:
@@ -403,13 +411,15 @@ class MLXEngine:
         self,
         messages: Sequence[Mapping[str, Any]],
         *,
+        tools: Sequence[Mapping[str, Any]] | None = None,
         template_kwargs: Mapping[str, Any] | None = None,
     ) -> list[int]:
-        return self._run(lambda: self._render_prompt(messages, template_kwargs))
+        return self._run(lambda: self._render_prompt(messages, tools, template_kwargs))
 
     def _render_prompt(
         self,
         messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]] | None = None,
         template_kwargs: Mapping[str, Any] | None = None,
     ) -> list[int]:
         """Tokenize a chat request exactly as generation will see it.
@@ -417,6 +427,13 @@ class MLXEngine:
         The chat template is applied here and nowhere else, so the tokens that
         train are the tokens that were served. Skipping it makes a base model
         run to the token ceiling instead of emitting its end-of-turn marker.
+
+        ``tools`` is rendered by the template, not by the caller: a template
+        states the schemas *and* the one call syntax it will parse back. A
+        request whose tools are dropped leaves the model guessing both, and it
+        guesses differently every time — the same model invented six call
+        syntaxes and a tool name that did not exist. Serving them is also what
+        makes the turn trainable on what it actually saw.
 
         A request's ``template_kwargs`` override the deployment's defaults key
         by key, which is how one caller turns a reasoning model's ``<think>``
@@ -426,6 +443,8 @@ class MLXEngine:
         if template_kwargs:
             _reject_reserved_template_kwargs(template_kwargs)
             extra.update(template_kwargs)
+        if tools:
+            extra["tools"] = [dict(tool) for tool in tools]
         prompt = self._tokenizer.apply_chat_template(
             [dict(message) for message in messages],
             tokenize=False,

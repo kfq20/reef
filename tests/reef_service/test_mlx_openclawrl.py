@@ -444,6 +444,10 @@ def test_the_engine_keeps_ownership_of_how_a_prompt_is_rendered() -> None:
             model_path="fake/model",
             chat_template_kwargs={"add_generation_prompt": False},
         )
+    # `tools` is a request field of its own; two sources would let one request
+    # declare two different toolsets.
+    with pytest.raises(ValueError, match="tools"):
+        MLXEngineConfig(model_path="fake/model", chat_template_kwargs={"tools": []})
 
 
 @pytest.mark.unit
