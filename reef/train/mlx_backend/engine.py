@@ -20,7 +20,7 @@ import shutil
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -88,10 +88,18 @@ class MLXEngineConfig:
     #: all: 16k positions in one pass is 16 GB, in 1k chunks it is 1 GB. Zero
     #: scores the whole sequence at once, which is fastest for short rows.
     log_probs_chunk_size: int = 0
+    #: Extra values handed to the chat template, the deployment's default for
+    #: every request. A reasoning model's template is the usual reason to set
+    #: one: Qwen3 opens a ``<think>`` block in the generation prompt unless
+    #: ``enable_thinking`` is false, and those tokens are then response tokens
+    #: like any other — they train, and they reach whatever reads the reply.
+    #: A request may override this per call.
+    chat_template_kwargs: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.model_path:
             raise ValueError("model_path must be non-empty")
+        _reject_reserved_template_kwargs(self.chat_template_kwargs)
         if isinstance(self.capture_topk, bool) or not isinstance(self.capture_topk, int) or self.capture_topk < 0:
             raise ValueError("capture_topk must be a non-negative integer")
         for name in ("lora_layers", "lora_rank", "max_tokens", "micro_batch_size"):
@@ -305,6 +313,21 @@ def _lora_reaches_keys_or_values(lora_keys: Sequence[str]) -> bool:
     return any("k_proj" in key or "v_proj" in key for key in lora_keys)
 
 
+#: Template arguments the engine owns. ``tokenize`` and ``add_generation_prompt``
+#: decide what a prompt *is*, so letting a caller set them would break the
+#: promise that the tokens which train are the tokens that were served.
+_RESERVED_TEMPLATE_KWARGS = ("tokenize", "add_generation_prompt", "conversation", "messages")
+
+
+def _reject_reserved_template_kwargs(template_kwargs: Mapping[str, Any]) -> None:
+    reserved = sorted(name for name in _RESERVED_TEMPLATE_KWARGS if name in template_kwargs)
+    if reserved:
+        raise ValueError(
+            f"chat_template_kwargs may not set {reserved}: the engine owns how a prompt is rendered, "
+            "so that the tokens which train are the tokens that were served"
+        )
+
+
 def _head_logits(holder: Any, hidden: mx.array) -> mx.array:
     """Project hidden states to vocabulary logits, tied or untied."""
     if hasattr(holder, "lm_head"):
@@ -376,20 +399,38 @@ class MLXEngine:
 
     # ---------------------------------------------------------------- serving
 
-    def render_prompt(self, messages: Sequence[Mapping[str, Any]]) -> list[int]:
-        return self._run(lambda: self._render_prompt(messages))
+    def render_prompt(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        template_kwargs: Mapping[str, Any] | None = None,
+    ) -> list[int]:
+        return self._run(lambda: self._render_prompt(messages, template_kwargs))
 
-    def _render_prompt(self, messages: Sequence[Mapping[str, Any]]) -> list[int]:
+    def _render_prompt(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        template_kwargs: Mapping[str, Any] | None = None,
+    ) -> list[int]:
         """Tokenize a chat request exactly as generation will see it.
 
         The chat template is applied here and nowhere else, so the tokens that
         train are the tokens that were served. Skipping it makes a base model
         run to the token ceiling instead of emitting its end-of-turn marker.
+
+        A request's ``template_kwargs`` override the deployment's defaults key
+        by key, which is how one caller turns a reasoning model's ``<think>``
+        block off without changing what the rest of the deployment serves.
         """
+        extra = dict(self._config.chat_template_kwargs)
+        if template_kwargs:
+            _reject_reserved_template_kwargs(template_kwargs)
+            extra.update(template_kwargs)
         prompt = self._tokenizer.apply_chat_template(
             [dict(message) for message in messages],
             tokenize=False,
             add_generation_prompt=True,
+            **extra,
         )
         return list(self._tokenizer.encode(prompt))
 

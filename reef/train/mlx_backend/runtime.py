@@ -451,6 +451,20 @@ class MLXRuntime(TrainingRuntime):
         return self._serving_runtime_load_id
 
 
+def _template_kwargs(value: Any) -> Mapping[str, Any]:
+    """The deployment's chat-template defaults, checked before the engine boots.
+
+    A misspelt key here is silent — chat templates ignore what they do not
+    read — so the only thing worth rejecting is a value of the wrong shape,
+    which would otherwise surface as a template error on the first request.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise RuntimeContractError("reef.runtime_config.chat_template_kwargs must be a mapping")
+    return {str(key): item for key, item in value.items()}
+
+
 @register_runtime_kind
 class MLXRuntimeFactory(RuntimeFactory):
     """Build the in-process MLX runtime from a deployment's runtime config.
@@ -502,6 +516,7 @@ class MLXRuntimeFactory(RuntimeFactory):
             micro_batch_size=int(config.get("micro_batch_size", 8)),
             log_probs_chunk_size=int(config.get("log_probs_chunk_size", 0)),
             prefill_step_size=int(config.get("prefill_step_size", 0)),
+            chat_template_kwargs=_template_kwargs(config.get("chat_template_kwargs")),
         )
         timeout = config.get("inference_timeout_s")
         return MLXRuntime(

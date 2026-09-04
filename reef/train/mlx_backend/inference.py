@@ -48,12 +48,19 @@ class MLXInferenceBackend(InferenceBackend):
 
         max_tokens = payload.get("max_completion_tokens", payload.get("max_tokens"))
         temperature = payload.get("temperature")
+        # The field OpenAI-compatible servers use to steer a chat template —
+        # `enable_thinking` above all, which decides whether a reasoning
+        # model's `<think>` block becomes response tokens.
+        template_kwargs = payload.get("chat_template_kwargs")
+        if template_kwargs is not None and not isinstance(template_kwargs, Mapping):
+            raise UpstreamStatusError("chat_template_kwargs must be an object", status=400)
         async with self._lock:
             rollout = await asyncio.to_thread(
                 self._generate,
                 messages,
                 None if max_tokens is None else int(max_tokens),
                 None if temperature is None else float(temperature),
+                template_kwargs,
             )
         if not rollout.output_tokens:
             # A completion with no response tokens can never be a policy
@@ -64,9 +71,15 @@ class MLXInferenceBackend(InferenceBackend):
             raise UpstreamStatusError("the model produced no response tokens", status=502)
         return self._response(payload, rollout)
 
-    def _generate(self, messages: list[Any], max_tokens: int | None, temperature: float | None) -> Any:
+    def _generate(
+        self,
+        messages: list[Any],
+        max_tokens: int | None,
+        temperature: float | None,
+        template_kwargs: Mapping[str, Any] | None = None,
+    ) -> Any:
         engine = self._runtime.engine
-        prompt_tokens = engine.render_prompt(messages)
+        prompt_tokens = engine.render_prompt(messages, template_kwargs=template_kwargs)
         return engine.generate(prompt_tokens, max_tokens=max_tokens, temperature=temperature)
 
     def _response(self, request: Mapping[str, Any], rollout: Any) -> dict[str, Any]:

@@ -433,6 +433,32 @@ def test_a_cached_prompt_is_refused_when_the_adapter_reaches_keys_or_values() ->
 
 
 @pytest.mark.unit
+def test_the_engine_keeps_ownership_of_how_a_prompt_is_rendered() -> None:
+    # `add_generation_prompt` and `tokenize` decide what a prompt *is*. A
+    # caller that could set them could serve one token sequence and train
+    # another, which is the one promise `render_prompt` exists to keep.
+    from reef.train.mlx_backend.engine import MLXEngineConfig
+
+    with pytest.raises(ValueError, match="add_generation_prompt"):
+        MLXEngineConfig(
+            model_path="fake/model",
+            chat_template_kwargs={"add_generation_prompt": False},
+        )
+
+
+@pytest.mark.unit
+def test_a_deployment_can_default_a_template_flag() -> None:
+    from reef.train.mlx_backend.engine import MLXEngineConfig
+
+    config = MLXEngineConfig(
+        model_path="fake/model",
+        chat_template_kwargs={"enable_thinking": False},
+    )
+
+    assert config.chat_template_kwargs == {"enable_thinking": False}
+
+
+@pytest.mark.unit
 def test_a_cached_prompt_is_allowed_when_only_queries_are_adapted() -> None:
     from reef.train.mlx_backend.engine import MLXEngineConfig
 

@@ -300,6 +300,19 @@ def test_the_factory_refuses_stale_sample_training() -> None:
 
 
 @pytest.mark.unit
+def test_the_factory_refuses_template_kwargs_of_the_wrong_shape() -> None:
+    with pytest.raises(RuntimeContractError, match="chat_template_kwargs"):
+        RuntimeRegistry().build(
+            {
+                "type": "mlx",
+                "checkpoint_dir": "/tmp/reef-mlx-test",
+                "chat_template_kwargs": "enable_thinking=false",
+            },
+            model_path="fake/model",
+        )
+
+
+@pytest.mark.unit
 def test_an_unsupported_loss_family_is_refused(tmp_path: Path) -> None:
     # The runtime implements one objective; training a recipe's data under a
     # different loss than it asked for would be a silent substitution.
@@ -387,12 +400,14 @@ class _FakeEngineForServing:
         self._rollout = rollout
         self.config = FakeEngineConfig()
         self.publications = 0
+        self.template_kwargs = "unset"
 
     def next_runtime_load_id(self) -> str:
         self.publications += 1
         return f"fake-{self.publications}"
 
-    def render_prompt(self, messages):
+    def render_prompt(self, messages, *, template_kwargs=None):
+        self.template_kwargs = template_kwargs
         return [11, 12, 13]
 
     def generate(self, prompt_tokens, *, max_tokens=None, temperature=None):
@@ -444,6 +459,57 @@ def test_no_candidate_channel_when_capture_is_off() -> None:
 
     assert "topk_indices" not in training
     assert "topk_log_probs" not in training
+
+
+@pytest.mark.unit
+def test_a_request_steers_the_chat_template() -> None:
+    """A reasoning model's ``<think>`` block is response tokens, so whether the
+    template opens one has to be a per-request decision."""
+    import asyncio
+
+    from reef.artifact.artifact import Artifact
+    from reef.train.mlx_backend.inference import MLXInferenceBackend
+
+    engine = _FakeEngineForServing(_FakeRollout())
+    backend = MLXInferenceBackend(MLXRuntime(engine, checkpoint_dir="/tmp/reef-mlx-template-test"))
+    asyncio.run(
+        backend.inference(
+            Artifact.local(Path("/tmp")),
+            "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+    )
+    assert engine.template_kwargs == {"enable_thinking": False}
+
+
+@pytest.mark.unit
+def test_a_request_without_template_kwargs_leaves_the_deployment_default() -> None:
+    engine = _FakeEngineForServing(_FakeRollout())
+    import asyncio
+
+    from reef.artifact.artifact import Artifact
+    from reef.train.mlx_backend.inference import MLXInferenceBackend
+
+    backend = MLXInferenceBackend(MLXRuntime(engine, checkpoint_dir="/tmp/reef-mlx-template-test"))
+    asyncio.run(
+        backend.inference(
+            Artifact.local(Path("/tmp")),
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hi"}]},
+        )
+    )
+    assert engine.template_kwargs is None
+
+
+@pytest.mark.unit
+def test_a_malformed_template_kwargs_field_is_refused() -> None:
+    from reef.runtime.inference import UpstreamStatusError
+
+    with pytest.raises(UpstreamStatusError, match="chat_template_kwargs"):
+        _serve({"messages": [{"role": "user", "content": "hi"}], "chat_template_kwargs": "no-think"})
 
 
 @pytest.mark.unit
