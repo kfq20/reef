@@ -332,6 +332,55 @@ def test_each_term_moves_the_adapter_on_its_own() -> None:
 
 
 @pytest.mark.integration
+def test_the_kl_term_prices_drift_and_all_but_ignores_the_base() -> None:
+    """The penalty must be negligible where the policy still is the base, and
+    real once it has left — that contrast is the whole mechanism.
+
+    Not asserted as exact equality at the base: the reference log-probs come
+    from a second forward pass, and two numerically identical passes still
+    differ by ~5e-3 nats in this model's precision. What matters is that the
+    residual is orders of magnitude below what actual drift costs.
+    """
+
+    def step(engine, row, kl_coef):
+        return engine.openclawrl_step(
+            [row],
+            w_rl=1.0,
+            w_opd=0.0,
+            eps_lo=0.2,
+            eps_hi=0.28,
+            diff_clip=1.0,
+            hint_selection="sequence_optimal",
+            native_k=8,
+            kl_coef=kl_coef,
+        )
+
+    engine, row = _engine_and_row()
+    try:
+        # lora_b starts at zero, so the policy *is* the base here.
+        at_base = step(engine, row, 1.0)["loss"] - step(engine, row, 0.0)["loss"]
+
+        # MLX streams are per-thread, so build the arrays on the engine's own.
+        def drift() -> None:
+            engine._apply_adapter(
+                {n: (v + 0.05 if n.endswith("lora_b") else v) for n, v in engine._adapter_snapshot().items()}
+            )
+
+        engine._run(drift)
+        drifted_with = step(engine, row, 1.0)["loss"]
+        engine._run(drift)
+        drifted_without = step(engine, row, 0.0)["loss"]
+        after_drift = drifted_with - drifted_without
+    finally:
+        engine.close()
+
+    # k3 is non-negative, so the penalty only ever raises the loss.
+    assert after_drift > 0.0
+    assert abs(at_base) < 1e-3
+    assert after_drift > 100 * abs(at_base)
+
+
+@pytest.mark.integration
 def test_the_teacher_pass_leaves_the_adapter_where_it_found_it() -> None:
     # The teacher is the frozen base, reached by zeroing lora_b in place. If
     # that were not restored, serving would answer from the bare base model.
@@ -340,12 +389,15 @@ def test_the_teacher_pass_leaves_the_adapter_where_it_found_it() -> None:
     engine, row = _engine_and_row()
     try:
         before = engine.adapter_snapshot()
-        gathered, native = engine._run(lambda: engine._teacher_rows(row, 8))
+        gathered, native, reference = engine._run(lambda: engine._teacher_rows(row, 8, with_reference=True))
         delta, changed = engine.adapter_delta(before, engine.adapter_snapshot())
     finally:
         engine.close()
 
     assert len(gathered) == 2 and len(native) == 2
+    # The reference pass runs inside the same zeroed window, so it must leave
+    # the adapter exactly as it found it too.
+    assert reference is not None and reference.shape == (len(row.loss_mask),)
     assert delta == 0.0
     assert changed == 0
 

@@ -62,6 +62,10 @@ class MLXEngineConfig:
     lora_dropout: float = 0.0
     lora_keys: tuple[str, ...] = DEFAULT_LORA_KEYS
     learning_rate: float = 1e-5
+    #: AdamW's decoupled decay. MLX defaults to 0.01; slime's OpenClaw-RL run
+    #: sets 0.1, and this stays at MLX's default until a deployment asks for
+    #: the reference's.
+    weight_decay: float = 0.01
     max_tokens: int = 256
     temperature: float = 1.0
     top_p: float = 1.0
@@ -216,6 +220,15 @@ class _ObjectiveWeights:
     eps_lo: float
     eps_hi: float
     diff_clip: float | None
+    #: Penalty on divergence from the frozen base, the term slime exposes as
+    #: ``--use-kl-loss`` with ``kl_loss_coef``. Zero leaves it out entirely,
+    #: which is what the reference config does. It earns its place when the
+    #: policy's whole output distribution sinks rather than only the tokens
+    #: the distillation term targets: over 33 steps at lr 3e-5 the style
+    #: markers fell 0.88 nats — the intended effect — but everything else
+    #: fell 0.21, and the policy collapsed into emitting one tool call
+    #: unconditionally. This holds the rest of the distribution in place.
+    kl_coef: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -379,7 +392,10 @@ class MLXEngine:
         self._model, self._tokenizer = load(self._config.model_path)[:2]
         self._model.freeze()
         linear_to_lora_layers(self._model, self._config.lora_layers, self._lora_parameters())
-        self._optimizer = optim.AdamW(learning_rate=self._config.learning_rate)
+        self._optimizer = optim.AdamW(
+            learning_rate=self._config.learning_rate,
+            weight_decay=self._config.weight_decay,
+        )
         self._holder = _head_holder(self._model)
 
     def _run(self, work: Callable[[], Any]) -> Any:
@@ -653,12 +669,19 @@ class MLXEngine:
         mx.eval(at_student, native)
         return at_student, native
 
-    def _teacher_rows(self, row: DistillationRow, native_k: int) -> tuple[list[mx.array], list[mx.array]]:
+    def _teacher_rows(
+        self, row: DistillationRow, native_k: int, *, with_reference: bool = False
+    ) -> tuple[list[mx.array], list[mx.array], mx.array | None]:
         """Score every hint candidate under the frozen base.
 
         ``lora_b`` is zeroed for the whole sweep rather than per candidate:
         the base is the same model for all of them, and restoring between
         passes would only buy repeated work.
+
+        ``with_reference`` also scores the row's *own* prompt — no hint — at
+        the tokens the policy sampled. That is the reference distribution a KL
+        penalty needs, and it costs one more forward inside a window where the
+        adapter is already zeroed, rather than a second zero-and-restore.
         """
         snapshot = self._adapter_snapshot()
         zeroed = {
@@ -674,7 +697,13 @@ class MLXEngine:
                 at_student, own = self._teacher_candidate(candidate, response_length, student_indices, native_k)
                 gathered.append(at_student)
                 native.append(own)
-            return gathered, native
+            reference = None
+            if with_reference:
+                cache = self._prefill(self._model, row.tokens, response_length)
+                logits = self._response_logits_of(self._model, row.tokens, response_length, cache)
+                reference = mx.stop_gradient(self._sampled_log_probs(logits, row, response_length))
+                mx.eval(reference)
+            return gathered, native, reference
         finally:
             self._apply_adapter(snapshot)
 
@@ -714,6 +743,7 @@ class MLXEngine:
         diff_clip: float | None,
         hint_selection: str,
         native_k: int,
+        kl_coef: float = 0.0,
     ) -> dict[str, Any]:
         """One OpenClaw-RL step: the reward term plus the distillation term.
 
@@ -734,6 +764,7 @@ class MLXEngine:
                 diff_clip=diff_clip,
                 hint_selection=hint_selection,
                 native_k=native_k,
+                kl_coef=kl_coef,
             )
         )
 
@@ -748,6 +779,7 @@ class MLXEngine:
         diff_clip: float | None,
         hint_selection: str,
         native_k: int,
+        kl_coef: float = 0.0,
     ) -> dict[str, Any]:
         if not rows:
             raise MLXEngineError("a training step requires at least one row")
@@ -757,20 +789,22 @@ class MLXEngine:
             # shrinks the weights it was asked not to train is worth refusing.
             raise MLXEngineError("openclawrl needs a non-zero w_rl or w_opd; both zero only decays the adapter")
 
-        weights = _ObjectiveWeights(w_rl, w_opd, eps_lo, eps_hi, diff_clip)
+        weights = _ObjectiveWeights(w_rl, w_opd, eps_lo, eps_hi, diff_clip, kl_coef)
         accumulated: dict[str, mx.array] | None = None
         total_loss = 0.0
         response_tokens = 0
 
         for row in rows:
             student_indices = mx.array([list(candidates) for candidates in row.topk_indices])
-            teacher_gathered, teacher_native = self._teacher_rows(row, native_k)
+            teacher_gathered, teacher_native, reference = self._teacher_rows(
+                row, native_k, with_reference=weights.kl_coef != 0.0
+            )
             chosen = self._select_hint(teacher_native, student_indices, hint_selection)
             # The selection is constant over a response today, so one index
             # picks the hint rather than a per-token gather.
             teacher_log_probs = teacher_gathered[_as_int(chosen[0])]
 
-            loss, flat = self._row_gradients(row, student_indices, teacher_log_probs, weights)
+            loss, flat = self._row_gradients(row, student_indices, teacher_log_probs, weights, reference)
             accumulated = flat if accumulated is None else {n: accumulated[n] + g for n, g in flat.items()}
             total_loss += loss
             response_tokens += len(row.loss_mask)
@@ -786,6 +820,7 @@ class MLXEngine:
             "optimizer_step": _as_int(self._optimizer.step),
             "w_rl": w_rl,
             "w_opd": w_opd,
+            "kl_coef": kl_coef,
         }
 
     def _row_gradients(
@@ -794,12 +829,15 @@ class MLXEngine:
         student_indices: mx.array,
         teacher_log_probs: mx.array,
         weights: _ObjectiveWeights,
+        reference_log_probs: mx.array | None = None,
     ) -> tuple[float, dict[str, mx.array]]:
         """Loss and gradients for one judged turn.
 
         The reward term carries the turn's single accept/reject bit on the
         tokens the policy sampled; the distillation term carries the teacher's
-        preference on every candidate it considered.
+        preference on every candidate it considered. A KL term, when a
+        reference is supplied, keeps the rest of the distribution from
+        drifting while those two reshape the part they target.
         """
         from reef.train.mlx_backend.objective import candidate_log_probs, opd_one_sample, policy_loss
 
@@ -841,6 +879,15 @@ class MLXEngine:
                     diff_clip=weights.diff_clip,
                 )
                 total = total + weights.w_opd * self._sample_mean(result.per_token_pg, mask)
+            if weights.kl_coef != 0.0 and reference_log_probs is not None:
+                # k3: exp(d) - d - 1 with d = ref - current. Non-negative,
+                # zero only where the policy still matches the base, and
+                # unlike a plain difference it cannot be driven negative to
+                # buy reward elsewhere.
+                current = self._sampled_log_probs(logits, row, response_length)
+                difference = mx.clip(reference_log_probs - current, -20.0, 20.0)
+                per_token_kl = mx.exp(difference) - difference - 1.0
+                total = total + weights.kl_coef * self._sample_mean(per_token_kl, mask)
             return total
 
         loss, grads = nn.value_and_grad(self._model, loss_fn)(self._model)

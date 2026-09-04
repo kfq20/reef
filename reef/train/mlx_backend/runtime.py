@@ -68,6 +68,7 @@ class MLXRuntime(TrainingRuntime):
             "eps_lo": 0.2,
             "eps_hi": 0.28,
             "diff_clip": 1.0,
+            "kl_coef": 0.0,
             "hint_selection": "sequence_optimal",
             "native_k": 20,
             **dict(openclawrl or {}),
@@ -256,6 +257,7 @@ class MLXRuntime(TrainingRuntime):
                     diff_clip=self._openclawrl["diff_clip"],
                     hint_selection=self._openclawrl["hint_selection"],
                     native_k=self._openclawrl["native_k"],
+                    kl_coef=self._openclawrl["kl_coef"],
                 )
             )
         from reef.train.mlx_backend.engine import TrainingRow
@@ -509,6 +511,7 @@ class MLXRuntimeFactory(RuntimeFactory):
             lora_keys=tuple(config.get("lora_keys", ("self_attn.q_proj", "self_attn.v_proj"))),
             capture_topk=int(config.get("capture_topk", 0)),
             learning_rate=float(config.get("learning_rate", 1e-5)),
+            weight_decay=float(config.get("weight_decay", 0.01)),
             max_tokens=int(config.get("max_tokens", 256)),
             temperature=float(config.get("temperature", 1.0)),
             top_p=float(config.get("top_p", 1.0)),
