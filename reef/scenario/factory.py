@@ -37,7 +37,7 @@ from reef.scenario.snapshot import (
     parse_snapshot_metadata,
     snapshot_metadata_for,
 )
-from reef.surface.base import ArtifactActivator, Surface
+from reef.surface.base import ArtifactActivator, RecoveryRestorer, Surface
 from reef.train.trainer import Trainer
 
 
@@ -264,6 +264,18 @@ class ScenarioFactory:
             local_dir=self._local_artifact_dir,
         )
         repository.synchronize_checkpoint()
+        if isinstance(surface.loader, RecoveryRestorer):
+            # Deciding which release should serve is not the same as the
+            # runtime holding it. A runtime whose weights live in this process
+            # lost them when the previous one exited, and nothing here used to
+            # put them back: the scenario resumed reporting its full step count
+            # while answering from the bare base model.
+            #
+            # `resolve` rather than `Artifact(ref, repository)`: the bare
+            # constructor carries neither the local path nor the metadata, so
+            # a restorer would see an artifact with nothing to load and no
+            # record of the version it was published under.
+            surface.loader.restore_recovered(repository.resolve(current_artifact), runtime)
         if isinstance(surface.loader, ArtifactActivator) and not isinstance(current_artifact, LiveWeightArtifactRef):
             # Traffic must not reach a recovered scenario before its committed
             # head is servable; a failed activation leaves the scenario unloaded.
