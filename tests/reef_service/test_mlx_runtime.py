@@ -532,6 +532,39 @@ def test_a_request_steers_the_chat_template() -> None:
 
 
 @pytest.mark.unit
+def test_openai_string_tool_call_arguments_render_as_a_mapping() -> None:
+    """An OpenAI client serialises a tool call's ``arguments`` as a JSON string;
+    the Qwen3 template needs a mapping to iterate. The engine parses the string
+    before applying the template so a real OpenAI agent (Hermes) round-trips."""
+    from reef.train.mlx_backend.engine import _prepare_messages
+
+    messages = [
+        {"role": "user", "content": "solve it"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "homework/0.txt"}'},
+                }
+            ],
+        },
+    ]
+    prepared = _prepare_messages(messages)
+    assert prepared[1]["tool_calls"][0]["function"]["arguments"] == {"path": "homework/0.txt"}
+
+    # A dict is left alone; a non-JSON string and a message with no tool_calls
+    # are untouched rather than dropped.
+    already = [{"role": "assistant", "tool_calls": [{"function": {"name": "f", "arguments": {"k": 1}}}]}]
+    assert _prepare_messages(already)[0]["tool_calls"][0]["function"]["arguments"] == {"k": 1}
+    malformed = [{"role": "assistant", "tool_calls": [{"function": {"name": "f", "arguments": "not json"}}]}]
+    assert _prepare_messages(malformed)[0]["tool_calls"][0]["function"]["arguments"] == "not json"
+    assert _prepare_messages([{"role": "user", "content": "hi"}]) == [{"role": "user", "content": "hi"}]
+
+
+@pytest.mark.unit
 def test_a_request_without_template_kwargs_leaves_the_deployment_default() -> None:
     engine = _FakeEngineForServing(_FakeRollout())
     import asyncio

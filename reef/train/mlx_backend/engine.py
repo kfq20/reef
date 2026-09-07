@@ -285,6 +285,47 @@ def _reject_reserved_template_kwargs(template_kwargs: Mapping[str, Any]) -> None
         )
 
 
+def _prepare_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Copy messages, parsing OpenAI string tool-call arguments into dicts.
+
+    An OpenAI client (Hermes is one) serialises a tool call's ``arguments`` as
+    a JSON *string*; the Qwen3 template iterates ``tool_call.arguments|items``
+    and needs a mapping, raising "Can only get item pairs from a mapping" on a
+    string. A caller that already passes a dict (this repo's own stream driver
+    did) never hit it, so the round-trip was only broken for real OpenAI
+    clients. Parse the string here — the one place the template is applied —
+    and leave a dict, a non-JSON string, or a missing field untouched.
+    """
+    prepared: list[dict[str, Any]] = []
+    for message in messages:
+        rendered = dict(message)
+        calls = rendered.get("tool_calls")
+        if isinstance(calls, list):
+            rendered["tool_calls"] = [_prepare_tool_call(call) for call in calls]
+        prepared.append(rendered)
+    return prepared
+
+
+def _prepare_tool_call(call: Any) -> Any:
+    if not isinstance(call, Mapping):
+        return call
+    fn = call.get("function")
+    if not isinstance(fn, Mapping):
+        return call
+    arguments = fn.get("arguments")
+    if not isinstance(arguments, str):
+        return call
+    try:
+        parsed = json.loads(arguments)
+    except ValueError:
+        return call
+    if not isinstance(parsed, dict):
+        return call
+    copy = dict(call)
+    copy["function"] = {**fn, "arguments": parsed}
+    return copy
+
+
 def _head_logits(holder: Any, hidden: mx.array) -> mx.array:
     """Project hidden states to vocabulary logits, tied or untied."""
     if hasattr(holder, "lm_head"):
@@ -398,7 +439,7 @@ class MLXEngine:
         if tools:
             extra["tools"] = [dict(tool) for tool in tools]
         prompt = self._tokenizer.apply_chat_template(
-            [dict(message) for message in messages],
+            _prepare_messages(messages),
             tokenize=False,
             add_generation_prompt=True,
             **extra,
