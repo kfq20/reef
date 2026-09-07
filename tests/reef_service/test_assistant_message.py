@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from reef.runtime.assistant_message import reasoning_is_pre_opened, split_assistant_message
+from reef.runtime.assistant_message import (
+    ReasoningStreamSplitter,
+    ToolMarkerStreamHold,
+    reasoning_is_pre_opened,
+    split_assistant_message,
+)
 
 
 class _Parser:
@@ -99,3 +104,67 @@ def test_the_pre_opened_sniff_reads_the_generation_prompt_tail() -> None:
     assert reasoning_is_pre_opened(template("<|im_start|>assistant\n<think>\n")) is True
     assert reasoning_is_pre_opened(template("<|im_start|>assistant\n")) is False
     assert reasoning_is_pre_opened(SimpleNamespace()) is False  # no template at all
+
+
+# ------------------------------------------------------------- streaming halves
+
+
+def _drain(splitter: ReasoningStreamSplitter, *deltas: str) -> list[tuple[str, str]]:
+    parts: list[tuple[str, str]] = []
+    for delta in deltas:
+        parts.extend(splitter.feed(delta))
+    parts.extend(splitter.finish())
+    return parts
+
+
+@pytest.mark.unit
+def test_a_closing_tag_split_across_deltas_is_still_one_boundary() -> None:
+    parts = _drain(ReasoningStreamSplitter(enabled=True, force_reasoning=True), "work</thi", "nk>\nanswer")
+    assert parts == [("thinking", "work"), ("text", "answer")]
+
+
+@pytest.mark.unit
+def test_a_pre_opened_block_that_never_closes_stays_reasoning() -> None:
+    parts = _drain(ReasoningStreamSplitter(enabled=True, force_reasoning=True), "still ", "thinking")
+    assert parts == [("thinking", "still "), ("thinking", "thinking")]
+
+
+@pytest.mark.unit
+def test_an_undecided_stream_becomes_text_once_it_cannot_be_a_tag() -> None:
+    parts = _drain(ReasoningStreamSplitter(enabled=True, force_reasoning=False), "<th", "e answer")
+    assert parts == [("text", "<the answer")]
+
+
+@pytest.mark.unit
+def test_a_call_opened_inside_streamed_thinking_ends_the_thinking() -> None:
+    splitter = ReasoningStreamSplitter(enabled=True, force_reasoning=True, tool_call_start="<tool_call>")
+    parts = _drain(splitter, "look first\n<tool_", "call>\n<function=read_file>", "\n</tool_call>")
+    assert parts[0] == ("thinking", "look first\n")
+    assert (
+        "".join(value for kind, value in parts if kind == "text") == "<tool_call>\n<function=read_file>\n</tool_call>"
+    )
+    assert all(kind == "text" for kind, _ in parts[1:])
+
+
+@pytest.mark.unit
+def test_the_hold_shows_text_up_to_the_marker_and_nothing_after() -> None:
+    hold = ToolMarkerStreamHold("<tool_call>")
+    shown = [hold.feed("I'll read it.\n<tool_"), hold.feed("call>\n<function=read_file>"), hold.feed("</tool_call>")]
+    assert shown == ["I'll read it.", "", ""]
+    assert hold.finish() == ""
+
+
+@pytest.mark.unit
+def test_the_hold_releases_a_false_alarm_and_trailing_whitespace_at_the_end() -> None:
+    hold = ToolMarkerStreamHold("<tool_call>")
+    assert hold.feed("a < b ") == "a < b"  # a "<" already followed by a space is text; trailing space waits
+    assert hold.feed("and <to") == " and"  # "<to" could still become the marker
+    assert hold.feed("p!\n") == " <top!"
+    assert hold.finish() == "\n"
+
+
+@pytest.mark.unit
+def test_the_hold_is_transparent_without_a_marker() -> None:
+    hold = ToolMarkerStreamHold(None)
+    assert hold.feed("<tool_call> as text ") == "<tool_call> as text "
+    assert hold.finish() == ""

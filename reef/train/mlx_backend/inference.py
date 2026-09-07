@@ -15,15 +15,22 @@ decoded text and never touches the tensors.
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from reef.artifact.artifact import Artifact
-from reef.runtime.assistant_message import THINK_OPEN, split_assistant_message
-from reef.runtime.inference import InferenceBackend, UpstreamStatusError
+from reef.runtime.assistant_message import (
+    THINK_OPEN,
+    ReasoningStreamSplitter,
+    ToolMarkerStreamHold,
+    split_assistant_message,
+)
+from reef.runtime.inference import InferenceBackend, InferenceStream, UpstreamStatusError
 
 
 @dataclass(frozen=True)
@@ -109,6 +116,47 @@ def prompt_opens_reasoning(tokenizer: Any, prompt_tokens: Sequence[int]) -> bool
     return str(tail).rstrip().endswith(THINK_OPEN)
 
 
+@dataclass(frozen=True)
+class _ChatRequest:
+    """One validated chat-completions request, buffered or streamed alike."""
+
+    messages: list[Any]
+    max_tokens: int | None
+    temperature: float | None
+    template_kwargs: Mapping[str, Any] | None
+    tools: list[Any] | None
+    parser: MLXToolCallParser | None
+
+
+class _LoopListener:
+    """The engine's ``GenerationListener`` for one stream, bridging its thread to the event loop."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._stop = threading.Event()
+        self.pieces: asyncio.Queue[str | None] = asyncio.Queue()
+
+    def emit(self, piece: str) -> None:
+        self._loop.call_soon_threadsafe(self.pieces.put_nowait, piece)
+
+    def cancelled(self) -> bool:
+        return self._stop.is_set()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def _unsent(final: Any, emitted: str) -> str:
+    """What the canonical field still owes the wire, given what the stream showed of it."""
+    if not isinstance(final, str) or not final.startswith(emitted):
+        return ""
+    return final[len(emitted) :]
+
+
+def _sse(event: Mapping[str, Any]) -> bytes:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
+
+
 class MLXInferenceBackend(InferenceBackend):
     """Answer chat completions from the runtime's resident MLX model."""
 
@@ -125,17 +173,58 @@ class MLXInferenceBackend(InferenceBackend):
         path: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        if payload.get("stream") is True:
+            # The buffered path answers with one JSON body. A caller that
+            # asked for a stream and got that would parse something that is
+            # not SSE; the service routes streams to ``inference_stream``.
+            raise UpstreamStatusError("a streaming completion is served by inference_stream", status=400)
+        request = self._parse_request(path, payload)
+        async with self._lock:
+            rollout, opens_reasoning = await asyncio.to_thread(self._generate, request)
+        if not rollout.output_tokens:
+            # A completion with no response tokens can never be a policy
+            # sample: `policy_row_violation` rejects an empty loss mask, the
+            # processor marks the report terminally unusable, and a grid-based
+            # recipe would then wait forever for a slot that can never fill.
+            # Fail the request instead, so the caller retries a rollout.
+            raise UpstreamStatusError("the model produced no response tokens", status=502)
+        return self._response(payload, rollout, request.parser, force_reasoning=opens_reasoning)
+
+    async def inference_stream(
+        self,
+        artifact: Artifact,
+        path: str,
+        payload: dict[str, Any],
+    ) -> InferenceStream:
+        """Serve one chat completion as OpenAI chunks while it is being sampled.
+
+        The wire carries deltas as the engine settles them; the trainable
+        record is the same response the buffered path builds, attached as
+        ``record_response`` once the sample is complete and parsed, so the
+        service records exactly what a buffered request would have recorded.
+        """
+        request = self._parse_request(path, payload)
+        holder: dict[str, InferenceStream] = {}
+        chunks = self._stream_chunks(payload, request, holder)
+        stream = InferenceStream(
+            status=200,
+            headers={"Content-Type": "text/event-stream; charset=utf-8"},
+            chunks=chunks,
+            # Closing the stream early must stop the engine, not just drop
+            # the bytes: the generator's cleanup cancels the generation and
+            # waits for it before the engine lock is released.
+            close=chunks.aclose,
+            record_response_pending=True,
+        )
+        holder["stream"] = stream
+        return stream
+
+    def _parse_request(self, path: str, payload: Mapping[str, Any]) -> _ChatRequest:
         if not path.rstrip("/").endswith("chat/completions"):
             raise UpstreamStatusError(f"the mlx backend serves chat completions, not {path!r}", status=404)
-        if payload.get("stream") is True:
-            # The base class would hand back the whole JSON body as one
-            # "stream" chunk, which is not SSE and would leave the caller
-            # parsing something that is not a provider stream.
-            raise UpstreamStatusError("the mlx backend does not implement streaming completions", status=400)
         messages = payload.get("messages")
         if not isinstance(messages, list) or not messages:
             raise UpstreamStatusError("chat completions require a non-empty messages list", status=400)
-
         max_tokens = payload.get("max_completion_tokens", payload.get("max_tokens"))
         temperature = payload.get("temperature")
         # The field OpenAI-compatible servers use to steer a chat template —
@@ -155,39 +244,144 @@ class MLXInferenceBackend(InferenceBackend):
         # `tool_calls`. `tool_choice: none` declares the tools for context
         # only, as the OpenAI dialect defines it.
         parser = None if payload.get("tool_choice") == "none" else self._tool_call_parser(tools)
-        async with self._lock:
-            rollout, opens_reasoning = await asyncio.to_thread(
-                self._generate,
-                messages,
-                None if max_tokens is None else int(max_tokens),
-                None if temperature is None else float(temperature),
-                template_kwargs,
-                tools,
-            )
-        if not rollout.output_tokens:
-            # A completion with no response tokens can never be a policy
-            # sample: `policy_row_violation` rejects an empty loss mask, the
-            # processor marks the report terminally unusable, and a grid-based
-            # recipe would then wait forever for a slot that can never fill.
-            # Fail the request instead, so the caller retries a rollout.
-            raise UpstreamStatusError("the model produced no response tokens", status=502)
-        return self._response(payload, rollout, parser, force_reasoning=opens_reasoning)
+        return _ChatRequest(
+            messages=messages,
+            max_tokens=None if max_tokens is None else int(max_tokens),
+            temperature=None if temperature is None else float(temperature),
+            template_kwargs=template_kwargs,
+            tools=tools,
+            parser=parser,
+        )
 
     def _tool_call_parser(self, tools: list[Any] | None) -> MLXToolCallParser | None:
         return MLXToolCallParser.for_tokenizer(self._runtime.engine.tokenizer, tools)
 
-    def _generate(
-        self,
-        messages: list[Any],
-        max_tokens: int | None,
-        temperature: float | None,
-        template_kwargs: Mapping[str, Any] | None = None,
-        tools: list[Any] | None = None,
-    ) -> tuple[Any, bool]:
+    def _render(self, request: _ChatRequest) -> tuple[list[int], bool]:
         engine = self._runtime.engine
-        prompt_tokens = engine.render_prompt(messages, tools=tools, template_kwargs=template_kwargs)
-        opens_reasoning = prompt_opens_reasoning(engine.tokenizer, prompt_tokens)
-        return engine.generate(prompt_tokens, max_tokens=max_tokens, temperature=temperature), opens_reasoning
+        prompt_tokens = engine.render_prompt(
+            request.messages, tools=request.tools, template_kwargs=request.template_kwargs
+        )
+        return prompt_tokens, prompt_opens_reasoning(engine.tokenizer, prompt_tokens)
+
+    def _generate(self, request: _ChatRequest) -> tuple[Any, bool]:
+        prompt_tokens, opens_reasoning = self._render(request)
+        rollout = self._runtime.engine.generate(
+            prompt_tokens, max_tokens=request.max_tokens, temperature=request.temperature
+        )
+        return rollout, opens_reasoning
+
+    async def _stream_chunks(
+        self,
+        payload: Mapping[str, Any],
+        request: _ChatRequest,
+        holder: Mapping[str, InferenceStream],
+    ) -> AsyncGenerator[bytes, None]:
+        common = {
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": str(payload.get("model") or self._runtime.engine.config.model_path),
+        }
+
+        def chunk(delta: Mapping[str, Any], *, finish_reason: str | None = None, **extra: Any) -> bytes:
+            return _sse(
+                {**common, "choices": [{"index": 0, "delta": dict(delta), "finish_reason": finish_reason, **extra}]}
+            )
+
+        async with self._lock:
+            engine = self._runtime.engine
+            prompt_tokens, opens_reasoning = await asyncio.to_thread(self._render, request)
+            marker = None if request.parser is None else request.parser.tool_call_start
+            reasoning = ReasoningStreamSplitter(enabled=True, force_reasoning=opens_reasoning, tool_call_start=marker)
+            hold = ToolMarkerStreamHold(marker)
+            emitted_reasoning = ""
+            emitted_text = ""
+
+            # The engine thread hands each settled piece of text to the event
+            # loop; ``None`` marks the end of the generation, whatever ended it.
+            listener = _LoopListener(asyncio.get_running_loop())
+            pieces = listener.pieces
+            generation = asyncio.ensure_future(
+                asyncio.to_thread(
+                    engine.generate_stream,
+                    prompt_tokens,
+                    listener=listener,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                )
+            )
+            generation.add_done_callback(lambda _: pieces.put_nowait(None))
+
+            def show(kind: str, value: str) -> bytes | None:
+                nonlocal emitted_reasoning, emitted_text
+                if kind == "thinking":
+                    emitted_reasoning += value
+                    return chunk({"reasoning_content": value})
+                visible = hold.feed(value)
+                if not visible:
+                    return None
+                emitted_text += visible
+                return chunk({"content": visible})
+
+            try:
+                yield chunk({"role": "assistant"})
+                while True:
+                    piece = await pieces.get()
+                    if piece is None:
+                        break
+                    for kind, value in reasoning.feed(piece):
+                        if (out := show(kind, value)) is not None:
+                            yield out
+                rollout = await generation
+                for kind, value in reasoning.finish():
+                    if (out := show(kind, value)) is not None:
+                        yield out
+                tail = hold.finish()
+                if tail:
+                    emitted_text += tail
+                    yield chunk({"content": tail})
+                if not rollout.output_tokens:
+                    raise UpstreamStatusError("the model produced no response tokens", status=502)
+
+                # The canonical message, parsed whole: what the record holds
+                # and what the wire is reconciled to. Whatever the stream has
+                # not shown yet — the held tool-call markup as `tool_calls`,
+                # a final piece of text — goes out now, before the terminal.
+                response = self._response(payload, rollout, request.parser, force_reasoning=opens_reasoning)
+                response["id"] = common["id"]
+                response["created"] = common["created"]
+                choice = response["choices"][0]
+                message = choice["message"]
+                if rest := _unsent(message.get("reasoning_content"), emitted_reasoning):
+                    yield chunk({"reasoning_content": rest})
+                if rest := _unsent(message.get("content"), emitted_text):
+                    yield chunk({"content": rest})
+                for index, call in enumerate(message.get("tool_calls") or []):
+                    yield chunk(
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": index,
+                                    "id": call["id"],
+                                    "type": "function",
+                                    "function": dict(call["function"]),
+                                }
+                            ]
+                        }
+                    )
+                holder["stream"].record_response = response
+                terminal = {"finish_reason": choice["finish_reason"]}
+                if "meta_info" in choice:
+                    terminal["meta_info"] = choice["meta_info"]
+                yield chunk({}, **terminal)
+                yield b"data: [DONE]\n\n"
+            finally:
+                # Reached on completion, on failure, and when the consumer
+                # closes early. The engine is told to stop and waited for,
+                # so the lock never opens on a generation still running.
+                listener.stop()
+                if not generation.done():
+                    await asyncio.gather(generation, return_exceptions=True)
 
     def _response(
         self,

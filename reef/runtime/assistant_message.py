@@ -126,10 +126,129 @@ def split_assistant_message(
     return message, True
 
 
+def _held_suffix(value: str, delimiter: str) -> int:
+    """How many trailing characters of ``value`` could be the start of ``delimiter``."""
+    for size in range(min(len(value), len(delimiter) - 1), 0, -1):
+        if delimiter.startswith(value[-size:]):
+            return size
+    return 0
+
+
+class ReasoningStreamSplitter:
+    """Split sampled thinking tags without waiting for the full completion.
+
+    The streaming counterpart of the reasoning half of
+    :func:`split_assistant_message`, with the same decisions: a pre-opened
+    block (``force_reasoning``) starts in thinking mode, and a tool call
+    that opens before ``</think>`` ends the thinking when ``tool_call_start``
+    is known. Text that could still turn out to be a tag is held back until
+    the next delta settles it.
+    """
+
+    def __init__(self, *, enabled: bool, force_reasoning: bool, tool_call_start: str | None = None) -> None:
+        self._mode = "thinking" if enabled and force_reasoning else ("undecided" if enabled else "text")
+        self._buffer = ""
+        self._marker = tool_call_start
+
+    def feed(self, delta: str) -> list[tuple[str, str]]:
+        if not delta:
+            return []
+        if self._mode == "text":
+            return [("text", delta)]
+        self._buffer += delta
+        if self._mode == "undecided":
+            if THINK_OPEN.startswith(self._buffer) and len(self._buffer) < len(THINK_OPEN):
+                return []
+            if self._buffer.startswith(THINK_OPEN):
+                self._buffer = self._buffer[len(THINK_OPEN) :]
+                self._mode = "thinking"
+            else:
+                value, self._buffer = self._buffer, ""
+                self._mode = "text"
+                return [("text", value)]
+
+        close = self._buffer.find(THINK_CLOSE)
+        call = self._buffer.find(self._marker) if self._marker else -1
+        if call != -1 and (close == -1 or call < close):
+            # The model started acting before it closed its thinking: the
+            # call is a call, and everything from it on is text.
+            thinking, text = self._buffer[:call], self._buffer[call:]
+            self._buffer = ""
+            self._mode = "text"
+            parts = [("thinking", thinking)] if thinking else []
+            return [*parts, ("text", text)]
+        if close != -1:
+            before, after = self._buffer[:close], self._buffer[close + len(THINK_CLOSE) :]
+            self._buffer = ""
+            self._mode = "text"
+            parts = [("thinking", before)] if before else []
+            visible = after.lstrip("\n")
+            if visible:
+                parts.append(("text", visible))
+            return parts
+        held = _held_suffix(self._buffer, THINK_CLOSE)
+        if self._marker:
+            held = max(held, _held_suffix(self._buffer, self._marker))
+        if held:
+            value = self._buffer[:-held]
+            self._buffer = self._buffer[-held:]
+        else:
+            value, self._buffer = self._buffer, ""
+        return [("thinking", value)] if value else []
+
+    def finish(self) -> list[tuple[str, str]]:
+        if not self._buffer:
+            return []
+        value, self._buffer = self._buffer, ""
+        kind = "thinking" if self._mode == "thinking" else "text"
+        return [(kind, value)]
+
+
+class ToolMarkerStreamHold:
+    """Show streamed text up to the first tool-call marker; hold the rest for end-of-stream parsing.
+
+    A parser that reads whole calls cannot say what a half-received call
+    means, so once the marker appears nothing more is shown until the
+    sample is complete and parsed. Before that, a tail that could still
+    become the marker, and any trailing whitespace ahead of it, are held
+    until the next delta settles them, the way Ollama's parsers do.
+    """
+
+    def __init__(self, marker: str | None) -> None:
+        self._marker = marker
+        self._buffer = ""
+        self._holding = False
+
+    def feed(self, delta: str) -> str:
+        if not self._marker:
+            return delta
+        if self._holding:
+            return ""
+        self._buffer += delta
+        index = self._buffer.find(self._marker)
+        if index != -1:
+            self._holding = True
+            visible, self._buffer = self._buffer[:index].rstrip(), ""
+            return visible
+        cut = len(self._buffer) - _held_suffix(self._buffer, self._marker)
+        while cut > 0 and self._buffer[cut - 1].isspace():
+            cut -= 1
+        visible, self._buffer = self._buffer[:cut], self._buffer[cut:]
+        return visible
+
+    def finish(self) -> str:
+        if self._holding:
+            return ""
+        value, self._buffer = self._buffer, ""
+        return value
+
+
 __all__ = [
     "THINK_CLOSE",
     "THINK_OPEN",
+    "ReasoningStreamSplitter",
     "ToolCallParser",
+    "ToolMarkerStreamHold",
     "reasoning_is_pre_opened",
     "split_assistant_message",
 ]

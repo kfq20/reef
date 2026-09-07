@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any
 
 from reef.artifact.artifact import Artifact, is_local_release
-from reef.runtime.assistant_message import reasoning_is_pre_opened, split_assistant_message
+from reef.runtime.assistant_message import ReasoningStreamSplitter, reasoning_is_pre_opened, split_assistant_message
 from reef.runtime.inference import HttpInferenceBackend, InferenceStream
 
 CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
@@ -147,65 +147,6 @@ class _NativeStreamCapture:
         if versions is not None:
             response["_reef_token_runtime_load_ids"] = versions
         return response
-
-
-class _ReasoningStreamSplitter:
-    """Split sampled thinking tags without waiting for the full completion."""
-
-    _OPEN = "<think>"
-    _CLOSE = "</think>"
-
-    def __init__(self, *, enabled: bool, force_reasoning: bool) -> None:
-        self._mode = "thinking" if enabled and force_reasoning else ("undecided" if enabled else "text")
-        self._buffer = ""
-
-    @staticmethod
-    def _held_suffix(value: str, delimiter: str) -> int:
-        for size in range(min(len(value), len(delimiter) - 1), 0, -1):
-            if delimiter.startswith(value[-size:]):
-                return size
-        return 0
-
-    def feed(self, delta: str) -> list[tuple[str, str]]:
-        if not delta:
-            return []
-        if self._mode == "text":
-            return [("text", delta)]
-        self._buffer += delta
-        if self._mode == "undecided":
-            if self._OPEN.startswith(self._buffer) and len(self._buffer) < len(self._OPEN):
-                return []
-            if self._buffer.startswith(self._OPEN):
-                self._buffer = self._buffer[len(self._OPEN) :]
-                self._mode = "thinking"
-            else:
-                value, self._buffer = self._buffer, ""
-                self._mode = "text"
-                return [("text", value)]
-
-        before, separator, after = self._buffer.partition(self._CLOSE)
-        if separator:
-            self._buffer = ""
-            self._mode = "text"
-            parts = [("thinking", before)] if before else []
-            visible = after.lstrip("\n")
-            if visible:
-                parts.append(("text", visible))
-            return parts
-        held = self._held_suffix(self._buffer, self._CLOSE)
-        if held:
-            value = self._buffer[:-held]
-            self._buffer = self._buffer[-held:]
-        else:
-            value, self._buffer = self._buffer, ""
-        return [("thinking", value)] if value else []
-
-    def finish(self) -> list[tuple[str, str]]:
-        if not self._buffer:
-            return []
-        value, self._buffer = self._buffer, ""
-        kind = "thinking" if self._mode == "thinking" else "text"
-        return [(kind, value)]
 
 
 def _build_sglang_tool_parser(tools: list[dict[str, Any]], parser_name: str) -> Any:
@@ -657,7 +598,7 @@ class SGLangChatTrainingInferenceBackend(HttpInferenceBackend):
 
         async def chunks() -> AsyncIterator[bytes]:
             capture = _NativeStreamCapture()
-            reasoning = _ReasoningStreamSplitter(
+            reasoning = ReasoningStreamSplitter(
                 enabled=self._SPLIT_REASONING,
                 force_reasoning=self._reasoning_is_pre_opened(),
             )

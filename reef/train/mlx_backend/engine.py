@@ -34,7 +34,7 @@ from mlx_lm.sample_utils import make_sampler
 from mlx_lm.tuner import linear_to_lora_layers
 
 from reef.core.errors import ReefError
-from reef.train.mlx_backend.rows import DistillationRow, TeacherCandidate, TrainingRow
+from reef.train.mlx_backend.rows import DistillationRow, GenerationListener, TeacherCandidate, TrainingRow
 
 ADAPTER_WEIGHTS = "adapters.safetensors"
 ADAPTER_CONFIG = "adapter_config.json"
@@ -414,11 +414,28 @@ class MLXEngine:
     ) -> Rollout:
         return self._run(lambda: self._generate(prompt_tokens, max_tokens, temperature))
 
+    def generate_stream(
+        self,
+        prompt_tokens: Sequence[int],
+        *,
+        listener: GenerationListener,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> Rollout:
+        """``generate``, reporting each readable piece of text to ``listener`` as it is sampled.
+
+        A listener that answers ``cancelled`` stops the generation at that
+        token, and the partial rollout comes back with ``finish_reason``
+        ``"cancelled"`` so nothing records it.
+        """
+        return self._run(lambda: self._generate(prompt_tokens, max_tokens, temperature, listener))
+
     def _generate(
         self,
         prompt_tokens: Sequence[int],
         max_tokens: int | None,
         temperature: float | None,
+        listener: GenerationListener | None = None,
     ) -> Rollout:
         """Sample one completion, recording the log-prob of every chosen token.
 
@@ -439,11 +456,21 @@ class MLXEngine:
         topk_indices: list[tuple[int, ...]] = []
         topk_log_probs: list[tuple[float, ...]] = []
         finish_reason = "length"
+        # mlx-lm's streaming detokenizer releases text only once a token
+        # boundary has settled it, so a multi-byte character never reaches
+        # the caller half-decoded. The rollout's own text is still decoded
+        # whole below; the pieces are for showing, not for training.
+        detokenizer = self._tokenizer.detokenizer if listener is not None else None
+        if detokenizer is not None:
+            detokenizer.reset()
         for token, step_log_probs in generate_step(prompt, self._model, max_tokens=limit, sampler=sampler):
             # mlx-lm yields a plain int here; older versions yield a 0-d array.
             token_id = _as_int(token)
             if token_id in stop_ids:
                 finish_reason = "stop"
+                break
+            if listener is not None and listener.cancelled():
+                finish_reason = "cancelled"
                 break
             chosen = step_log_probs[token_id]
             if capture:
@@ -458,6 +485,16 @@ class MLXEngine:
                 mx.eval(chosen)
             output.append(token_id)
             log_probs.append(_as_float(chosen))
+            if detokenizer is not None and listener is not None:
+                detokenizer.add_token(token_id)
+                piece = detokenizer.last_segment
+                if piece:
+                    listener.emit(piece)
+        if detokenizer is not None and listener is not None:
+            detokenizer.finalize()
+            piece = detokenizer.last_segment
+            if piece:
+                listener.emit(piece)
         return Rollout(
             prompt_tokens=tuple(int(value) for value in prompt_tokens),
             output_tokens=tuple(output),

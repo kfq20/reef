@@ -423,13 +423,19 @@ class _FakeServingTokenizer:
 
 
 class _FakeEngineForServing:
-    def __init__(self, rollout, tokenizer=None):
+    def __init__(self, rollout, tokenizer=None, pieces=None):
         self._rollout = rollout
         self.config = FakeEngineConfig()
         self.tokenizer = tokenizer or _FakeServingTokenizer()
         self.publications = 0
         self.template_kwargs = "unset"
         self.tools = "unset"
+        # What a streamed generation hands out piece by piece; the text
+        # split in two unless a test wants specific boundaries.
+        text = rollout.text
+        self.pieces = list(pieces) if pieces is not None else [text[: len(text) // 2], text[len(text) // 2 :]]
+        self.streamed: list[str] = []
+        self.cancelled_after: int | None = None
 
     def next_runtime_load_id(self) -> str:
         self.publications += 1
@@ -441,6 +447,16 @@ class _FakeEngineForServing:
         return [11, 12, 13]
 
     def generate(self, prompt_tokens, *, max_tokens=None, temperature=None):
+        return self._rollout
+
+    def generate_stream(self, prompt_tokens, *, listener, max_tokens=None, temperature=None):
+        for index, piece in enumerate(self.pieces):
+            if listener.cancelled():
+                self.cancelled_after = index
+                self._rollout.finish_reason = "cancelled"
+                return self._rollout
+            self.streamed.append(piece)
+            listener.emit(piece)
         return self._rollout
 
 
@@ -592,10 +608,10 @@ def test_a_malformed_template_kwargs_field_is_refused() -> None:
 
 
 @pytest.mark.unit
-def test_streaming_is_refused_rather_than_faked() -> None:
+def test_the_buffered_path_refuses_a_stream_request_rather_than_faking_one() -> None:
     from reef.runtime.inference import UpstreamStatusError
 
-    with pytest.raises(UpstreamStatusError, match="streaming"):
+    with pytest.raises(UpstreamStatusError, match="inference_stream"):
         _serve({"messages": [{"role": "user", "content": "hi"}], "stream": True})
 
 
@@ -897,3 +913,172 @@ def test_the_real_qwen3_coder_parser_coerces_arguments_by_schema() -> None:
     assert remaining == "I'll set it."
     assert call.name == "set_uv_threshold"
     assert call.parameters == {"index": 5}
+
+
+# ------------------------------------------------------------------- streaming
+
+
+def _serve_stream(payload, *, text="an answer", finish_reason="stop", tokenizer=None, pieces=None, take=None):
+    """Stream one completion; the SSE frames, the stream object, and the engine.
+
+    ``take`` stops consuming after that many frames and closes the stream,
+    the way the service does when a client goes away."""
+    import asyncio
+
+    from reef.artifact.artifact import Artifact
+    from reef.train.mlx_backend.inference import MLXInferenceBackend
+
+    engine = _FakeEngineForServing(_FakeRollout(text=text, finish_reason=finish_reason), tokenizer, pieces=pieces)
+    backend = MLXInferenceBackend(MLXRuntime(engine, checkpoint_dir="/tmp/reef-mlx-stream-test"))
+
+    async def run():
+        stream = await backend.inference_stream(
+            Artifact.local(Path("/tmp")), "/v1/chat/completions", {**payload, "stream": True}
+        )
+        frames = []
+        async for frame in stream.chunks:
+            frames.append(frame)
+            if take is not None and len(frames) >= take:
+                break
+        await stream.close()
+        return frames, stream, backend
+
+    frames, stream, backend = asyncio.run(run())
+    return frames, stream, engine, backend
+
+
+def _events(frames):
+    """Every JSON chunk on the wire, in order; ``"[DONE]"`` for the terminator."""
+    events = []
+    for frame in frames:
+        for line in frame.decode().split("\n"):
+            if line.startswith("data: "):
+                data = line[len("data: ") :]
+                events.append(data if data == "[DONE]" else json.loads(data))
+    return events
+
+
+def _deltas(events, key):
+    return "".join(
+        event["choices"][0]["delta"].get(key, "") for event in events if isinstance(event, dict) and "choices" in event
+    )
+
+
+@pytest.mark.unit
+def test_a_stream_shows_the_text_as_it_is_sampled_and_records_the_whole_sample() -> None:
+    frames, stream, engine, _ = _serve_stream({"messages": [{"role": "user", "content": "hi"}]}, text="an answer")
+    events = _events(frames)
+
+    assert events[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert events[0]["object"] == "chat.completion.chunk"
+    assert _deltas(events, "content") == "an answer"
+    assert engine.streamed == ["an a", "nswer"]
+    terminal = events[-2]["choices"][0]
+    assert terminal["finish_reason"] == "stop" and terminal["meta_info"]["runtime_load_id"] == "fake-1"
+    assert events[-1] == "[DONE]"
+    # The record is what the buffered path would have built, tensors and all.
+    assert stream.record_response_pending is True
+    assert stream.record_response["choices"][0]["message"] == {"role": "assistant", "content": "an answer"}
+    assert stream.record_response["training"]["tokens"] == [11, 12, 13, 21, 22]
+    assert stream.record_response["id"] == events[0]["id"]
+
+
+@pytest.mark.unit
+def test_a_stream_splits_reasoning_from_content_as_it_goes() -> None:
+    frames, stream, _, _ = _serve_stream(
+        {"messages": [{"role": "user", "content": "hi"}]},
+        text="pondering</think>\nThe answer is 36.",
+        pieces=["ponder", "ing</thi", "nk>\nThe answer", " is 36."],
+        tokenizer=_FakeServingTokenizer(prompt_tail=THINKING_TAIL),
+    )
+    events = _events(frames)
+
+    assert _deltas(events, "reasoning_content") == "pondering"
+    assert _deltas(events, "content") == "The answer is 36."
+    assert stream.record_response["choices"][0]["message"]["reasoning_content"] == "pondering"
+
+
+@pytest.mark.unit
+def test_a_streamed_tool_call_is_held_and_arrives_structurally() -> None:
+    """The wire never shows raw call markup: text before the marker streams, the call is
+    parsed whole at the end and sent as one ``tool_calls`` delta before the terminal."""
+    text = f"I'll read it.\n{XML_CALL}"
+    frames, stream, _, _ = _serve_stream(
+        {"messages": [{"role": "user", "content": "hi"}], "tools": READ_FILE},
+        text=text,
+        pieces=[
+            "I'll read",
+            " it.\n<tool_",
+            "call>\n<function=read_file>\n",
+            "<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>",
+        ],
+    )
+    events = _events(frames)
+    wire = b"".join(frames).decode()
+
+    assert "<tool_call>" not in wire and "<function=" not in wire
+    assert _deltas(events, "content") == "I'll read it."
+    [call_event] = [
+        e for e in events if isinstance(e, dict) and "tool_calls" in e.get("choices", [{}])[0].get("delta", {})
+    ]
+    [call] = call_event["choices"][0]["delta"]["tool_calls"]
+    assert call["index"] == 0 and call["function"] == {"name": "read_file", "arguments": '{"path": "README.md"}'}
+    assert call["id"] == stream.record_response["choices"][0]["message"]["tool_calls"][0]["id"]
+    assert events[-2]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+@pytest.mark.unit
+def test_closing_a_stream_early_stops_the_engine_and_frees_the_backend() -> None:
+    import asyncio
+
+    from reef.artifact.artifact import Artifact
+
+    _, stream, engine, backend = _serve_stream(
+        {"messages": [{"role": "user", "content": "hi"}]},
+        text="a b c d",
+        pieces=["a ", "b ", "c ", "d"],
+        take=2,
+    )
+
+    assert stream.record_response is None  # nothing complete, nothing to record
+    assert len(engine.streamed) <= 4
+    # The lock was released after the generation stopped: the next request runs.
+    again = asyncio.run(
+        backend.inference(
+            Artifact.local(Path("/tmp")), "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}
+        )
+    )
+    assert again["choices"][0]["finish_reason"] in ("stop", "cancelled")
+
+
+@pytest.mark.unit
+def test_a_stream_of_no_response_tokens_fails_before_the_terminal() -> None:
+    import asyncio
+
+    from reef.artifact.artifact import Artifact
+    from reef.runtime.inference import UpstreamStatusError
+    from reef.train.mlx_backend.inference import MLXInferenceBackend
+
+    rollout = _FakeRollout(text="")
+    rollout.output_tokens = ()
+    rollout.rollout_log_probs = ()
+    rollout.topk_indices = ()
+    rollout.topk_log_probs = ()
+    engine = _FakeEngineForServing(rollout, pieces=[])
+    backend = MLXInferenceBackend(MLXRuntime(engine, checkpoint_dir="/tmp/reef-mlx-stream-test"))
+
+    async def run():
+        stream = await backend.inference_stream(
+            Artifact.local(Path("/tmp")),
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+        frames = []
+        with pytest.raises(UpstreamStatusError, match="no response tokens"):
+            async for frame in stream.chunks:
+                frames.append(frame)
+        return frames, stream
+
+    frames, stream = asyncio.run(run())
+    assert b"[DONE]" not in b"".join(frames)
+    assert stream.record_response is None

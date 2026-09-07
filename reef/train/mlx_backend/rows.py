@@ -1,14 +1,29 @@
-"""The rows the MLX runtime hands its engine: plain data, no MLX.
+"""What the MLX runtime and its engine exchange: plain data and contracts, no MLX.
 
 They live apart from the engine so that the runtime's contract with Reef —
-preparation, candidate export, activation, rollback — can be exercised
-against a fake engine on a machine without the optional ``mlx`` extra. The
-engine imports them from here; MLX is only reached when an engine is built.
+preparation, candidate export, activation, rollback, serving — can be
+exercised against a fake engine on a machine without the optional ``mlx``
+extra. The engine imports them from here; MLX is only reached when an engine
+is built.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
+
+
+class GenerationListener(Protocol):
+    """Who a streaming generation reports to while it runs.
+
+    ``emit`` is called on the engine thread with each piece of text as the
+    detokenizer settles it, so it must only hand the piece off. ``cancelled``
+    is polled once per token; answering ``True`` ends the generation there.
+    """
+
+    def emit(self, piece: str) -> None: ...
+
+    def cancelled(self) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -77,4 +92,4 @@ class DistillationRow:
                 raise ValueError("a teacher sequence must be its prompt plus the whole response")
 
 
-__all__ = ["DistillationRow", "TeacherCandidate", "TrainingRow"]
+__all__ = ["DistillationRow", "GenerationListener", "TeacherCandidate", "TrainingRow"]

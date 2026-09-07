@@ -116,3 +116,40 @@ def test_chunking_adds_no_meaningful_error_in_float16(chunk: int) -> None:
     whole_error = worst_relative_deviation(reference, whole)
     chunked_error = worst_relative_deviation(reference, chunked)
     assert chunked_error <= max(whole_error * 1.5, 1e-3)
+
+
+class _Collector:
+    """A GenerationListener that keeps what it hears and can be told to stop after some pieces."""
+
+    def __init__(self, stop_after: int | None = None) -> None:
+        self.pieces: list[str] = []
+        self.stop_after = stop_after
+
+    def emit(self, piece: str) -> None:
+        self.pieces.append(piece)
+
+    def cancelled(self) -> bool:
+        return self.stop_after is not None and len(self.pieces) >= self.stop_after
+
+
+@pytest.mark.integration
+def test_streamed_pieces_are_the_rollout_text_and_a_cancelled_stream_stops_early() -> None:
+    """The pieces the detokenizer releases concatenate to exactly the text the rollout decodes
+    whole, so a client that watched the stream saw what the record holds; and a listener that
+    cancels ends the generation within a token, with a finish reason nothing will record."""
+    engine = MLXEngine(MLXEngineConfig(model_path=MODEL, lora_layers=2, max_tokens=24, seed=0))
+    try:
+        prompt = engine.render_prompt([{"role": "user", "content": "Count from one to twenty in words."}])
+        heard = _Collector()
+        rollout = engine.generate_stream(prompt, listener=heard, temperature=0.0)
+        assert "".join(heard.pieces) == rollout.text
+        assert len(heard.pieces) > 1
+        assert rollout.finish_reason in ("stop", "length")
+
+        stopped = _Collector(stop_after=3)
+        partial = engine.generate_stream(prompt, listener=stopped, temperature=0.0)
+        assert partial.finish_reason == "cancelled"
+        assert len(partial.output_tokens) < len(rollout.output_tokens)
+        assert "".join(stopped.pieces) == partial.text[: len("".join(stopped.pieces))]
+    finally:
+        engine.close()
