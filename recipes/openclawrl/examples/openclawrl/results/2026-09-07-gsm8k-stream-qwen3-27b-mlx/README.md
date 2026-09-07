@@ -11,6 +11,21 @@ engine, a served PRM, and a 32B student); this fits it on one 48 GB machine.
 held-out control separates the trained policy from the base model at
 `p = 1.7e-8`.
 
+## How it was run
+
+The reference harness ([`harness/agent.py`](../../harness/agent.py)) runs each
+session as a Harbor task — a container with the real Hermes agent, a judge
+sidecar, and reef-eval sequencing them. That stack does not run on Apple
+Silicon, so this result was produced by a **Mac-native driver standing in for
+Hermes**, aligned to the harness's session semantics: the same `problem.json`
+files, the unmodified `StudentSession` judge and acceptance criterion,
+`MAX_TURNS = 8`, an uncapped tool loop, and a dead turn recorded as a `failure`
+rather than scored. The one behavioural difference is tool-call plumbing —
+Hermes reads structured `tool_calls` from the API, while this driver parsed
+them from the reply text. The training tokens and log-probs are identical
+either way (they are captured from the raw stream, before any presentation
+split), so this bears on the agent loop and the judged prose, not the gradient.
+
 ## Result
 
 | metric | this run (MLX, 27B) | reference (4B, 7×GPU) |
