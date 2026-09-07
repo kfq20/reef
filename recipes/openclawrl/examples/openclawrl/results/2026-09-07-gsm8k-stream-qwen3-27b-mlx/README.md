@@ -89,3 +89,6 @@ learning rate, or a stronger KL, past the adaptation point) is the open item.
 - `learning_curve.png`, `curve.csv` — the run, from `learning_curve.py`.
 - `control.png` — base vs trained clean-reply rates on the accepted problems.
 - `serve.yaml` — the deployment (policy on MLX, judge + student on GLM-5.3).
+- [`mlx-runtime-notes.md`](mlx-runtime-notes.md) — runtime-general operational
+  notes: topology, how to read a step's training metrics, the adapter artifact
+  format, and the measured capacity envelope (how large a model fits on MLX).
