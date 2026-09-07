@@ -20,12 +20,7 @@ import pytest
 torch = pytest.importorskip("torch", reason="the torch reference is the thing under comparison")
 mx = pytest.importorskip("mlx.core", reason="the MLX port needs the optional mlx extra")
 
-from reef.train.mlx_backend.objective import (
-    candidate_log_probs,
-    masked_softmax,
-    opd_one_sample,
-    policy_loss,
-)
+from reef.train.mlx_backend.objective import candidate_log_probs, masked_softmax, opd_one_sample, policy_loss
 
 pytestmark = pytest.mark.integration
 
@@ -229,12 +224,7 @@ def test_policy_loss_matches_slime(reference) -> None:
 
 def _engine_and_row(capture=8):
     """A real rollout with captured candidates and two teacher hints."""
-    from reef.train.mlx_backend.engine import (
-        DistillationRow,
-        MLXEngine,
-        MLXEngineConfig,
-        TeacherCandidate,
-    )
+    from reef.train.mlx_backend.engine import DistillationRow, MLXEngine, MLXEngineConfig, TeacherCandidate
 
     engine = MLXEngine(
         MLXEngineConfig(

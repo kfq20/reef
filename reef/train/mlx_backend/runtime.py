@@ -27,6 +27,7 @@ from reef.runtime.inference import InferenceBackend
 from reef.runtime.registry import RuntimeFactory, register_runtime_kind
 from reef.train.algos.registry import resolve_preparer
 from reef.train.evaluation.contracts import SelectionDecision
+from reef.train.mlx_backend.rows import DistillationRow, TeacherCandidate, TrainingRow
 from reef.train.types import PolicySample, TrainingBatch, policy_samples
 
 logger = logging.getLogger(__name__)
@@ -206,8 +207,6 @@ class MLXRuntime(TrainingRuntime):
         naming precisely, because the alternative is training a distillation
         objective on no teacher at all.
         """
-        from reef.train.mlx_backend.engine import DistillationRow, TeacherCandidate
-
         rows = []
         for index, (sample, advantage) in enumerate(zip(samples, advantages, strict=True)):
             if not sample.topk_indices or not sample.topk_log_probs:
@@ -260,8 +259,6 @@ class MLXRuntime(TrainingRuntime):
                     kl_coef=self._openclawrl["kl_coef"],
                 )
             )
-        from reef.train.mlx_backend.engine import TrainingRow
-
         rows = [
             TrainingRow(
                 tokens=sample.tokens,
@@ -350,8 +347,6 @@ class MLXRuntime(TrainingRuntime):
         the rollout-to-base log-probability difference and ``mean_diff`` is its
         batch mean over trained tokens.
         """
-        from reef.train.mlx_backend.engine import TrainingRow
-
         base = self._engine.base_log_probs(rows)
         numerator = 0.0
         denominator = 0
@@ -485,14 +480,9 @@ class MLXRuntimeFactory(RuntimeFactory):
         recipe_config: Mapping[str, Any],
         environ: Mapping[str, str],
     ) -> MLXRuntime:
-        try:
-            from reef.train.mlx_backend.engine import MLXEngine, MLXEngineConfig
-        except ImportError as exc:
-            raise RuntimeContractError(
-                "the mlx runtime needs the optional MLX dependencies; install reef-infra[mlx] "
-                f"on Apple Silicon ({exc})"
-            ) from exc
-
+        # The deployment's contract is checked before MLX is imported: a
+        # misconfiguration is reported as itself, not as a missing extra,
+        # and the checks hold on any machine.
         max_staleness = config.get("max_staleness")
         if max_staleness:
             raise RuntimeContractError(
@@ -501,6 +491,15 @@ class MLXRuntimeFactory(RuntimeFactory):
         checkpoint_dir = config.get("checkpoint_dir")
         if not isinstance(checkpoint_dir, str) or not checkpoint_dir:
             raise RuntimeContractError("the mlx runtime requires reef.runtime_config.checkpoint_dir")
+        chat_template_kwargs = _template_kwargs(config.get("chat_template_kwargs"))
+
+        try:
+            from reef.train.mlx_backend.engine import MLXEngine, MLXEngineConfig
+        except ImportError as exc:
+            raise RuntimeContractError(
+                "the mlx runtime needs the optional MLX dependencies; install reef-infra[mlx] "
+                f"on Apple Silicon ({exc})"
+            ) from exc
 
         engine_config = MLXEngineConfig(
             model_path=model_path,
@@ -519,7 +518,7 @@ class MLXRuntimeFactory(RuntimeFactory):
             micro_batch_size=int(config.get("micro_batch_size", 8)),
             log_probs_chunk_size=int(config.get("log_probs_chunk_size", 0)),
             prefill_step_size=int(config.get("prefill_step_size", 0)),
-            chat_template_kwargs=_template_kwargs(config.get("chat_template_kwargs")),
+            chat_template_kwargs=chat_template_kwargs,
         )
         timeout = config.get("inference_timeout_s")
         return MLXRuntime(

@@ -17,13 +17,7 @@ import pytest
 mx = pytest.importorskip("mlx.core", reason="the MLX engine needs the optional mlx extra")
 pytest.importorskip("mlx_lm", reason="the MLX engine needs the optional mlx extra")
 
-from reef.train.mlx_backend.engine import (
-    MLXEngine,
-    MLXEngineConfig,
-    TrainingRow,
-    _head_holder,
-    _head_logits,
-)
+from reef.train.mlx_backend.engine import MLXEngine, MLXEngineConfig, TrainingRow, _head_holder, _head_logits
 
 #: Small enough to load quickly, real enough to exercise a genuine head.
 MODEL = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"

@@ -18,8 +18,7 @@ import pytest
 from reef.runtime.base import RuntimeContractError
 from reef.runtime.candidates import ModelCandidate
 from reef.runtime.registry import RuntimeRegistry
-from reef.train.algos.base import StepPreparer
-from reef.train.algos.base import register_step_preparer
+from reef.train.algos.base import StepPreparer, register_step_preparer
 from reef.train.algos.signals import StepScheduling, StepSignal
 from reef.train.evaluation.contracts import EvaluationResult, SelectionDecision
 from reef.train.mlx_backend.runtime import MLXRuntime
