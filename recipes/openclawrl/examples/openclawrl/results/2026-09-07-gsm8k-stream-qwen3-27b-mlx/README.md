@@ -15,9 +15,12 @@ held-out control separates the trained policy from the base model at
 
 The reference harness ([`harness/agent.py`](../../harness/agent.py)) runs each
 session as a Harbor task — a container with the real Hermes agent, a judge
-sidecar, and reef-eval sequencing them. That stack does not run on Apple
-Silicon, so this result was produced by a **Mac-native driver standing in for
-Hermes**, aligned to the harness's session semantics: the same `problem.json`
+sidecar, and reef-eval sequencing them. Those are plain Linux containers and
+run under Docker on macOS against a host-native Reef+MLX service (the harness
+takes a host-reachable `reef_url`, so the split is supported by design). This
+result, however, was produced by a **Mac-native driver standing in for
+Hermes** — chosen for fast iteration, not because the container path cannot run
+here — aligned to the harness's session semantics: the same `problem.json`
 files, the unmodified `StudentSession` judge and acceptance criterion,
 `MAX_TURNS = 8`, an uncapped tool loop, and a dead turn recorded as a `failure`
 rather than scored. The one behavioural difference is tool-call plumbing —
