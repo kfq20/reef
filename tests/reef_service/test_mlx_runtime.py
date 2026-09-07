@@ -385,20 +385,49 @@ def test_the_frozen_base_pass_runs_with_inference_closed(tmp_path: Path) -> None
 class _FakeRollout:
     """The engine's Rollout shape, without loading a model."""
 
-    def __init__(self, *, topk=True):
+    def __init__(self, *, topk=True, text="an answer", finish_reason="stop"):
         self.prompt_tokens = (11, 12, 13)
         self.output_tokens = (21, 22)
         self.rollout_log_probs = (-0.5, -0.25)
-        self.text = "an answer"
-        self.finish_reason = "stop"
+        self.text = text
+        self.finish_reason = finish_reason
         self.topk_indices = ((21, 99), (22, 98)) if topk else ()
         self.topk_log_probs = ((-0.5, -3.0), (-0.25, -4.0)) if topk else ()
 
 
+def _parse_xml_call(text: str, tools) -> dict:
+    """The shape of mlx-lm's ``qwen3_coder.parse_tool_call``: one call body to name and arguments."""
+    del tools
+    _, _, body = text.partition("<function=")
+    name, _, params = body.partition(">")
+    arguments = {}
+    for chunk in params.split("<parameter=")[1:]:
+        key, _, value = chunk.partition(">")
+        arguments[key] = value.split("</parameter>")[0].strip()
+    if not name.strip():
+        raise ValueError("no function")
+    return {"name": name.strip(), "arguments": arguments}
+
+
+class _FakeServingTokenizer:
+    """What the backend reads off mlx-lm's tokenizer: the prompt tail, and the parser it matched."""
+
+    def __init__(self, *, prompt_tail="<|im_start|>assistant\n", tool_calling=True, tool_parser=_parse_xml_call):
+        self.prompt_tail = prompt_tail
+        self.has_tool_calling = tool_calling
+        self.tool_call_start = "<tool_call>"
+        self.tool_call_end = "</tool_call>"
+        self.tool_parser = tool_parser
+
+    def decode(self, tokens):
+        return self.prompt_tail
+
+
 class _FakeEngineForServing:
-    def __init__(self, rollout):
+    def __init__(self, rollout, tokenizer=None):
         self._rollout = rollout
         self.config = FakeEngineConfig()
+        self.tokenizer = tokenizer or _FakeServingTokenizer()
         self.publications = 0
         self.template_kwargs = "unset"
         self.tools = "unset"
@@ -416,14 +445,14 @@ class _FakeEngineForServing:
         return self._rollout
 
 
-def _serve(payload, *, topk=True):
+def _serve(payload, *, topk=True, text="an answer", finish_reason="stop", tokenizer=None):
     import asyncio
 
     from reef.artifact.artifact import Artifact
     from reef.train.mlx_backend.inference import MLXInferenceBackend
 
     runtime = MLXRuntime(
-        _FakeEngineForServing(_FakeRollout(topk=topk)),
+        _FakeEngineForServing(_FakeRollout(topk=topk, text=text, finish_reason=finish_reason), tokenizer),
         checkpoint_dir="/tmp/reef-mlx-serving-test",
     )
     backend = MLXInferenceBackend(runtime)
@@ -686,3 +715,186 @@ def test_the_openclawrl_family_reaches_the_distillation_step(tmp_path: Path) -> 
     assert row.reward == 1.0
     assert row.candidates[0].hint == "Be terse."
     assert candidate.training_metrics["w_opd"] == 1.0
+
+
+# ------------------------------------------------------- reading the reply back
+
+READ_FILE = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        },
+    }
+]
+THINKING_TAIL = "<|im_start|>assistant\n<think>\n"
+NO_THINKING_TAIL = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+XML_CALL = "<tool_call>\n<function=read_file>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>"
+
+
+@pytest.mark.unit
+def test_reasoning_rides_reasoning_content_and_the_tensors_stay_whole() -> None:
+    """The split is presentation: the trained tokens are still the whole sample."""
+    response = _serve(
+        {"messages": [{"role": "user", "content": "hi"}]},
+        text="pondering</think>\nThe answer is 36.",
+        tokenizer=_FakeServingTokenizer(prompt_tail=THINKING_TAIL),
+    )
+    message = response["choices"][0]["message"]
+
+    assert message == {"role": "assistant", "content": "The answer is 36.", "reasoning_content": "pondering"}
+    assert response["training"]["tokens"] == [11, 12, 13, 21, 22]
+    assert response["training"]["loss_mask"] == [1, 1]
+
+
+@pytest.mark.unit
+def test_truncated_reasoning_never_comes_back_as_the_reply() -> None:
+    """A pre-opened ``<think>`` with no closing tag hit the cap mid-thought: no content, or a judge
+    scores chain-of-thought as the agent's answer."""
+    response = _serve(
+        {"messages": [{"role": "user", "content": "hi"}]},
+        text="Okay, first I should read the file",
+        finish_reason="length",
+        tokenizer=_FakeServingTokenizer(prompt_tail=THINKING_TAIL),
+    )
+    message = response["choices"][0]["message"]
+
+    assert message["content"] == ""
+    assert message["reasoning_content"] == "Okay, first I should read the file"
+    assert response["choices"][0]["finish_reason"] == "length"
+
+
+@pytest.mark.unit
+def test_a_request_that_disabled_thinking_is_read_as_plain_text() -> None:
+    """Same model, same template: ``enable_thinking: false`` closes the block in the prompt, so
+    an unclosed sample is an answer, not truncated reasoning. Decided per request."""
+    response = _serve(
+        {"messages": [{"role": "user", "content": "hi"}], "chat_template_kwargs": {"enable_thinking": False}},
+        text="The answer is 36.",
+        tokenizer=_FakeServingTokenizer(prompt_tail=NO_THINKING_TAIL),
+    )
+
+    assert response["choices"][0]["message"] == {"role": "assistant", "content": "The answer is 36."}
+
+
+@pytest.mark.unit
+def test_a_call_in_the_templates_syntax_reaches_the_wire_as_tool_calls() -> None:
+    """The template asked for calls in its syntax; the reply carries them as ``tool_calls`` so the
+    harness takes its tool branch, and feeds them back structurally instead of echoing markup."""
+    response = _serve(
+        {"messages": [{"role": "user", "content": "hi"}], "tools": READ_FILE}, text=f"I'll read it.\n{XML_CALL}"
+    )
+    choice = response["choices"][0]
+
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] == "I'll read it."
+    [call] = choice["message"]["tool_calls"]
+    assert call["function"] == {"name": "read_file", "arguments": '{"path": "README.md"}'}
+    assert call["id"].startswith("call_")
+    assert response["training"]["tokens"] == [11, 12, 13, 21, 22]
+
+
+@pytest.mark.unit
+def test_every_call_in_a_reply_is_parsed_in_order() -> None:
+    second = XML_CALL.replace("README.md", "NOTES.md")
+    response = _serve(
+        {"messages": [{"role": "user", "content": "hi"}], "tools": READ_FILE}, text=f"{XML_CALL}\n{second}"
+    )
+    calls = response["choices"][0]["message"]["tool_calls"]
+
+    assert [json.loads(call["function"]["arguments"])["path"] for call in calls] == ["README.md", "NOTES.md"]
+    assert response["choices"][0]["message"]["content"] is None
+
+
+@pytest.mark.unit
+def test_call_markup_without_a_declared_toolset_stays_text() -> None:
+    """No tools in the prompt means no call syntax was stated; the markup is what the model said."""
+    response = _serve({"messages": [{"role": "user", "content": "hi"}]}, text=XML_CALL)
+
+    assert response["choices"][0]["message"] == {"role": "assistant", "content": XML_CALL}
+    assert response["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.unit
+def test_tool_choice_none_declares_tools_for_context_only() -> None:
+    response = _serve(
+        {"messages": [{"role": "user", "content": "hi"}], "tools": READ_FILE, "tool_choice": "none"}, text=XML_CALL
+    )
+
+    assert "tool_calls" not in response["choices"][0]["message"]
+
+
+@pytest.mark.unit
+def test_a_template_mlx_lm_has_no_parser_for_leaves_the_reply_as_text() -> None:
+    response = _serve(
+        {"messages": [{"role": "user", "content": "hi"}], "tools": READ_FILE},
+        text=XML_CALL,
+        tokenizer=_FakeServingTokenizer(tool_calling=False),
+    )
+
+    assert response["choices"][0]["message"]["content"] == XML_CALL
+
+
+@pytest.mark.unit
+def test_a_call_that_never_closes_fails_the_request() -> None:
+    """Half a call that hit the token cap is not a reply; the agent retries a rollout."""
+    from reef.runtime.inference import UpstreamStatusError
+
+    with pytest.raises(UpstreamStatusError) as caught:
+        _serve(
+            {"messages": [{"role": "user", "content": "hi"}], "tools": READ_FILE},
+            text="<tool_call>\n<function=read_file>\n<parameter=path>\nREAD",
+            finish_reason="length",
+        )
+    assert caught.value.status == 502
+    assert "never closed" in str(caught.value)
+
+
+@pytest.mark.unit
+def test_a_call_opened_inside_thinking_ends_the_thinking() -> None:
+    """A thinking model that starts acting has stopped thinking (Ollama's Qwen3 parser agrees):
+    the call is a call, not the tail of truncated reasoning."""
+    response = _serve(
+        {"messages": [{"role": "user", "content": "hi"}], "tools": READ_FILE},
+        text=f"I should look first.\n{XML_CALL}",
+        tokenizer=_FakeServingTokenizer(prompt_tail=THINKING_TAIL),
+    )
+    message = response["choices"][0]["message"]
+
+    assert message["reasoning_content"] == "I should look first."
+    assert message["tool_calls"][0]["function"]["name"] == "read_file"
+
+
+@pytest.mark.unit
+def test_the_real_qwen3_coder_parser_coerces_arguments_by_schema() -> None:
+    """mlx-lm's parser for the Qwen3.8 template, driven exactly as the backend drives it: the XML
+    the model writes becomes typed arguments, with the tail of each value trimmed."""
+    qwen3_coder = pytest.importorskip("mlx_lm.tool_parsers.qwen3_coder")
+    from types import SimpleNamespace
+
+    from reef.train.mlx_backend.inference import MLXToolCallParser
+
+    tokenizer = SimpleNamespace(
+        has_tool_calling=True,
+        tool_call_start=qwen3_coder.tool_call_start,
+        tool_call_end=qwen3_coder.tool_call_end,
+        tool_parser=qwen3_coder.parse_tool_call,
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "set_uv_threshold",
+                "parameters": {"type": "object", "properties": {"index": {"type": "integer"}}},
+            },
+        }
+    ]
+    parser = MLXToolCallParser.for_tokenizer(tokenizer, tools)
+    text = "I'll set it.\n<tool_call>\n<function=set_uv_threshold>\n<parameter=index>\n5\n</parameter>\n</function>\n</tool_call>"
+
+    remaining, [call] = parser.parse_non_stream(text)
+
+    assert remaining == "I'll set it."
+    assert call.name == "set_uv_threshold"
+    assert call.parameters == {"index": 5}

@@ -96,8 +96,9 @@ class MLXEngineConfig:
     #: every request. A reasoning model's template is the usual reason to set
     #: one: Qwen3 opens a ``<think>`` block in the generation prompt unless
     #: ``enable_thinking`` is false, and those tokens are then response tokens
-    #: like any other — they train, and they reach whatever reads the reply.
-    #: A request may override this per call.
+    #: like any other: they train, and the served reply carries them as
+    #: ``reasoning_content`` rather than as the answer. A request may override
+    #: this per call.
     chat_template_kwargs: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
