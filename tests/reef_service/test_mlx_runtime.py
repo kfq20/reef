@@ -536,7 +536,9 @@ def test_openai_string_tool_call_arguments_render_as_a_mapping() -> None:
     """An OpenAI client serialises a tool call's ``arguments`` as a JSON string;
     the Qwen3 template needs a mapping to iterate. The engine parses the string
     before applying the template so a real OpenAI agent (Hermes) round-trips."""
-    from reef.train.mlx_backend.engine import _prepare_messages
+    # Imported from ``messages`` (not ``engine``) so it runs without the
+    # ``mlx`` extra installed, the way the rest of the adapter imports.
+    from reef.train.mlx_backend.messages import prepare_messages as _prepare_messages
 
     messages = [
         {"role": "user", "content": "solve it"},
