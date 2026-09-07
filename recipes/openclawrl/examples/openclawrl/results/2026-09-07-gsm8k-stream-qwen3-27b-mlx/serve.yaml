@@ -1,0 +1,130 @@
+# The OpenClaw-RL GSM8K stream, with everything but the policy hosted.
+#
+# The reference stack needs seven GPUs: Megatron on four, the rollout engine,
+# the PRM, and a 32B playing the student. Here the policy both serves and
+# trains in this process on MLX, and the two roles that only ever need text —
+# the PRM's votes and the student's reactions — go to GLM-5.3 over OpenRouter.
+
+run_dir: work/stack
+ready_timeout: 1800
+
+reef:
+  host: 127.0.0.1
+  port: 8904
+  model_path: mlx-community/Qwen3.8-27B-4bit
+  recipe: recipes.openclawrl.recipe:OpenClawRLRecipe
+  token: reef-local
+
+  # Judged turns per optimizer step; upstream uses 16 (= slime's
+  # --global-batch-size). Halved to 8 so a 24-session stream still produces
+  # enough steps to see movement, at the cost of a noisier gradient than the
+  # reference's. Each turn is still its own rollout — this batches the
+  # accumulation, not the sampling.
+  batch_size: 8
+  # A session's last turn has no next message to be judged by, so it only
+  # trains once the session has been idle this long.
+  session_ttl_s: 45
+  checkpoint_every_n_versions: 1
+
+  prm_url: https://openrouter.ai/api/v1/chat/completions
+  prm_api: openai
+  prm_model: z-ai/glm-5.3
+  prm_api_key_env: OPENROUTER_API_KEY
+  prm_m: 3
+  # GLM-5.3 cannot have reasoning disabled, and reasoning is billed against
+  # this budget. Too small and the vote comes back with a null content — a
+  # silent failure, not an error — so leave the judge room to think.
+  prm_max_tokens: 16384
+  # The policy's own tokenizer: the teacher renders hint-enhanced prompts with
+  # it whatever dialect the judge happens to speak.
+  prm_tokenizer_path: mlx-community/Qwen3.8-27B-4bit
+
+  runtime_type: mlx
+  runtime_config:
+    checkpoint_dir: work/checkpoints
+    # The ceiling on this model, measured rather than guessed. 48 of its 64
+    # layers are GatedDeltaNet, whose kernel has no vjp, so a gradient cannot
+    # cross one. Layer 63 is the last full-attention block and is reachable
+    # whole; layer 62's MLP is reachable too, because the gradient arrives
+    # from 63 without passing through 62's attention. Layer 61 is not:
+    # `lora_layers: 3` fails with [Primitive::vjp] Not implemented.
+    lora_layers: 2
+    lora_rank: 256
+    # k_proj and v_proj are adapted here, which rules out a cached prompt
+    # prefill (it would freeze tensors that depend on trained weights).
+    # prefill_step_size stays 0; these prompts are short.
+    lora_keys:
+      - mlp.gate_proj
+      - mlp.up_proj
+      - mlp.down_proj
+      - self_attn.q_proj
+      - self_attn.k_proj
+      - self_attn.v_proj
+      - self_attn.o_proj
+    # Between the reference's 1e-5 and the 1e-4 that diverged, and chosen
+    # against a measurement rather than split the difference: at 1e-5 the
+    # update is aimed well (style markers lose 7.5x more log-probability than
+    # everything else) but tiny — 0.39% of weight norm over 11 steps, and a
+    # marker log-prob change of -0.023, where flipping the sampling needs
+    # something like -0.4. At 1e-4 the same objective aimed far worse (1.15x):
+    # a large step lets the reward term's uniform push swamp the distillation
+    # term's per-token structure. So raise the rate only as far as the aim
+    # survives, and watch the ratio, not just the loss.
+    learning_rate: 3.0e-5
+    max_tokens: 512
+    # The reference samples rollouts at 0.6. At 1.0 this model emitted seven
+    # different tool-call syntaxes and collapsed into tool loops on one
+    # problem; much of what looked like harness noise was sampling noise.
+    temperature: 0.6
+    micro_batch_size: 1
+    capture_topk: 20
+    seed: 0
+    # Qwen3's template opens a `<think>` block unless told otherwise, and
+    # those are response tokens: they would train, and they would reach the
+    # style criterion that decides this benchmark's reward.
+    chat_template_kwargs:
+      enable_thinking: false
+
+    # Back to the weights the reference runs. Raising w_opd to 8 did aim the
+    # update better — the style markers' log-probability fell 5.5x faster
+    # than everything else's, against 1.15x at equal weights — but combined
+    # with a learning rate ten times the reference's it diverged after seven
+    # steps: responses grew to 1588 tokens, the loss jumped from -1.07 to
+    # 8.91, and the policy started emitting incoherent text.
+    #
+    # The reference reaches adaptation in fourteen sessions at equal weights.
+    # Its margin comes from batch 16 and lr 1e-5, not from reweighting the
+    # objective; taking the shortcut instead broke the run.
+    #
+    # slime sets weight decay to 0.1 where MLX defaults to 0.01. Same job as
+    # the KL term below: hold the weights nothing is actively steering.
+    weight_decay: 0.1
+
+    openclawrl:
+      w_rl: 1.0
+      w_opd: 1.0
+      # Priced against what was measured: at kl_coef 0 the untargeted tokens
+      # sank 0.21 nats over 33 steps and the policy collapsed into one
+      # repeated tool call. 0.05 is a first probe — large enough to be worth
+      # 5% of a unit advantage per nat of drift, small enough not to freeze
+      # the distillation term's own work. Watch `others` in the logit sweep:
+      # if it stops sinking while `markers` keeps falling, this is the right
+      # size; if `markers` stalls too, it is too big.
+      kl_coef: 0.05
+
+  inference_timeout_s: 1800
+  train_timeout_s: 3600
+  artifact_repository: work/artifacts.git
+  artifact_work_dir: work/artifact-work
+  artifact_cache_dir: work/artifact-cache
+  agent_record_dir: work/agent-record
+
+observability:
+  wandb:
+    enabled: false
+
+services:
+  - name: reef
+    command: ["${REEF_PYTHON}", "-m", "reef.service"]
+    ready: curl -sf http://127.0.0.1:8904/healthz
+    ready_timeout: 1800
