@@ -17,7 +17,15 @@ import pytest
 mx = pytest.importorskip("mlx.core", reason="the MLX engine needs the optional mlx extra")
 pytest.importorskip("mlx_lm", reason="the MLX engine needs the optional mlx extra")
 
-from reef.train.mlx_backend.engine import MLXEngine, MLXEngineConfig, TrainingRow, _head_holder, _head_logits
+from reef.train.mlx_backend.engine import (
+    MLXEngine,
+    MLXEngineConfig,
+    TrainingRow,
+    _head_holder,
+    _head_logits,
+    _ObjectiveWeights,
+)
+from reef.train.mlx_backend.rows import DistillationRow, TeacherCandidate
 
 #: Small enough to load quickly, real enough to exercise a genuine head.
 MODEL = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
@@ -95,6 +103,58 @@ def test_chunked_gradients_match_the_whole_sequence_in_float32() -> None:
     # chunked decomposition is the same mathematics.
     reference_loss, reference = gradients(0, float32=True)
     chunked_loss, chunked = gradients(64, float32=True)
+
+    assert abs(reference_loss - chunked_loss) / abs(reference_loss) < 1e-3
+    assert worst_relative_deviation(reference, chunked) < 1e-3
+
+
+def _distillation_row(response: int, k: int, prompt: int = 8):
+    mx.random.seed(1)
+    tokens = tuple(int(t) for t in mx.random.randint(0, 1000, (prompt + response,)).tolist())
+    topk_indices = tuple(tuple(int(x) for x in r) for r in mx.random.randint(0, 1000, (response, k)).tolist())
+    topk_log_probs = tuple(tuple(float(x) - 2.0 for x in r) for r in mx.random.normal((response, k)).tolist())
+    row = DistillationRow(
+        tokens=tokens,
+        loss_mask=(1,) * response,
+        rollout_log_probs=(-1.0,) * response,
+        reward=1.0,
+        topk_indices=topk_indices,
+        topk_log_probs=topk_log_probs,
+        candidates=(TeacherCandidate(hint="h", tokens=(*tokens, 0)),),
+    )
+    teacher_vals = [[v - 0.5 for v in r] for r in topk_log_probs]
+    reference_vals = [float(x) - 2.0 for x in mx.random.normal((response,)).tolist()]
+    return row, topk_indices, teacher_vals, reference_vals
+
+
+def _opd_gradients(chunk: int):
+    row, topk_indices, teacher_vals, reference_vals = _distillation_row(response=40, k=5)
+    weights = _ObjectiveWeights(w_rl=1.0, w_opd=1.0, eps_lo=0.2, eps_hi=0.28, diff_clip=None, kl_coef=0.05)
+    engine = MLXEngine(
+        MLXEngineConfig(model_path=MODEL, lora_layers=4, lora_rank=8, log_probs_chunk_size=chunk, seed=0)
+    )
+
+    def run():
+        engine._model.set_dtype(mx.float32)
+        # MLX streams are per-thread, so the teacher tensors are built here.
+        student_indices = mx.array([list(r) for r in topk_indices])
+        return engine._row_gradients(row, student_indices, mx.array(teacher_vals), weights, mx.array(reference_vals))
+
+    try:
+        loss, grads = engine._run(run)
+        return loss, {name: mx.array(value).astype(mx.float32) for name, value in grads.items()}
+    finally:
+        engine.close()
+
+
+@pytest.mark.integration
+def test_chunked_opd_gradients_match_the_whole_response_in_float32() -> None:
+    # The OpenClaw-RL path (_row_gradients) has its own chunking, over response
+    # positions, carrying the RL + distillation + KL terms. Same equivalence
+    # bar as the TTT-Discover path: float32, so only the decomposition is under
+    # test, not rounding.
+    reference_loss, reference = _opd_gradients(0)
+    chunked_loss, chunked = _opd_gradients(16)
 
     assert abs(reference_loss - chunked_loss) / abs(reference_loss) < 1e-3
     assert worst_relative_deviation(reference, chunked) < 1e-3

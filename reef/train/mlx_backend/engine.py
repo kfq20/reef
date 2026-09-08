@@ -1080,10 +1080,131 @@ class MLXEngine:
                 total = total + weights.kl_coef * self._sample_mean(per_token_kl, mask)
             return total
 
+        chunk = self._config.log_probs_chunk_size
         with self._differentiable():
+            # Chunk the output head when the response is long enough to make the
+            # [response, vocab] logits the memory ceiling — the same trade the
+            # TTT-Discover path makes, so a long response trains without ever
+            # materialising the whole logits tensor or its gradient. Only when
+            # the prompt is not cached, since chunking runs the body whole.
+            if chunk and self._holder is not None and cache is None and response_length > chunk:
+                return self._chunked_row_gradients(
+                    row, student_indices, teacher_log_probs, weights, reference_log_probs, chunk
+                )
             loss, grads = nn.value_and_grad(self._model, loss_fn)(self._model)
             mx.eval(loss, grads)
         return _as_float(loss), dict(_flat(grads))
+
+    def _chunked_row_gradients(
+        self,
+        row: DistillationRow,
+        student_indices: mx.array,
+        teacher_log_probs: mx.array,
+        weights: _ObjectiveWeights,
+        reference_log_probs: mx.array | None,
+        chunk: int,
+    ) -> tuple[float, dict[str, mx.array]]:
+        """``_row_gradients`` without ever holding the whole ``[response, vocab]``.
+
+        Same split as :meth:`_chunked_gradients`: run the body once for the
+        response hidden states (``vocab / hidden`` times smaller than logits),
+        score the objective over slices of those states so nothing larger than
+        ``[chunk, vocab]`` exists at a time, then carry the assembled cotangent
+        back through the body in one vjp. Every OPD/RL/KL term is a per-position
+        sum reduced by the sample's constant token count, so summing the slices
+        and dividing once reproduces the whole-response gradient exactly.
+        """
+        from reef.train.mlx_backend.objective import candidate_log_probs, opd_one_sample, policy_loss
+
+        holder = self._holder
+        response_length = len(row.loss_mask)
+        start = len(row.tokens) - response_length - 1
+        inputs = mx.array([list(row.tokens)])[:, :-1]
+
+        mask = mx.array([float(value) for value in row.loss_mask])
+        sampled_tokens = mx.array(list(row.tokens[-response_length:]))
+        student_captured = mx.array([list(values) for values in row.topk_log_probs])
+        reward = float(row.reward)
+        # The _sample_mean denominator, shared by every term and constant with
+        # respect to the weights, so it factors out of the per-slice sums.
+        denom = mx.maximum(mx.sum(mask), mx.array(1.0))
+
+        hidden = holder.model(inputs)
+        mx.eval(hidden)
+        response_hidden = hidden[:, start : start + response_length]
+
+        total_loss = mx.zeros((), dtype=mx.float32)
+        cotangents = []
+        for begin in range(0, response_length, chunk):
+            stop = min(begin + chunk, response_length)
+            mask_s = mask[begin:stop]
+            sampled_s = sampled_tokens[begin:stop]
+            indices_s = student_indices[begin:stop]
+            captured_s = student_captured[begin:stop]
+            teacher_s = teacher_log_probs[begin:stop]
+            reference_s = None if reference_log_probs is None else reference_log_probs[begin:stop]
+
+            def slice_loss(
+                hidden_slice: mx.array,
+                mask_s: mx.array = mask_s,
+                sampled_s: mx.array = sampled_s,
+                indices_s: mx.array = indices_s,
+                captured_s: mx.array = captured_s,
+                teacher_s: mx.array = teacher_s,
+                reference_s: mx.array | None = reference_s,
+            ) -> mx.array:
+                logits = _head_logits(holder, hidden_slice)[0]
+
+                def sampled_log_probs() -> mx.array:
+                    gathered = mx.take_along_axis(logits, sampled_s[:, None], axis=-1)[:, 0]
+                    return gathered - mx.logsumexp(logits, axis=-1)
+
+                total = mx.zeros((), dtype=mx.float32)
+                if weights.w_rl != 0.0:
+                    sampled = sampled_log_probs()
+                    ppo_kl = mx.clip(mx.stop_gradient(sampled) - sampled, -20.0, 20.0)
+                    advantages = mx.full(sampled.shape, reward, dtype=mx.float32)
+                    per_token, _ = policy_loss(ppo_kl, advantages, weights.eps_lo, weights.eps_hi)
+                    total = total + weights.w_rl * mx.sum(per_token * mask_s)
+                if weights.w_opd != 0.0:
+                    result = opd_one_sample(
+                        candidate_log_probs(logits, indices_s),
+                        student_indices=indices_s,
+                        student_captured_log_probs=captured_s,
+                        teacher_indices=indices_s,
+                        teacher_log_probs=teacher_s,
+                        eps_lo=weights.eps_lo,
+                        eps_hi=weights.eps_hi,
+                        diff_clip=weights.diff_clip,
+                    )
+                    total = total + weights.w_opd * mx.sum(result.per_token_pg * mask_s)
+                if weights.kl_coef != 0.0 and reference_s is not None:
+                    difference = mx.clip(reference_s - sampled_log_probs(), -20.0, 20.0)
+                    per_token_kl = mx.exp(difference) - difference - 1.0
+                    total = total + weights.kl_coef * mx.sum(per_token_kl * mask_s)
+                return total / denom
+
+            loss_slice, (cotangent,) = mx.vjp(slice_loss, [response_hidden[:, begin:stop]], [mx.array(1.0)])
+            mx.eval(loss_slice, cotangent)
+            total_loss = total_loss + loss_slice[0].astype(mx.float32)
+            cotangents.append(cotangent)
+
+        # The head reads only the response positions, so the body's cotangent is
+        # the assembled response cotangent there and zero over the prompt.
+        response_cotangent = mx.concatenate(cotangents, axis=1)
+        prefix = mx.zeros((hidden.shape[0], start, hidden.shape[2]), dtype=response_cotangent.dtype)
+        seed = mx.concatenate([prefix, response_cotangent], axis=1)
+
+        trainable = _flat(self._model.trainable_parameters())
+        names = [name for name, _ in trainable]
+
+        def body(*params: mx.array) -> mx.array:
+            self._model.update(tree_unflatten(list(zip(names, params, strict=True))))
+            return holder.model(inputs)
+
+        _, gradients = mx.vjp(body, [value for _, value in trainable], [seed])
+        mx.eval(gradients)
+        return _as_float(total_loss), dict(zip(names, gradients, strict=True))
 
     @staticmethod
     def _sample_mean(per_token: mx.array, mask: mx.array) -> mx.array:
