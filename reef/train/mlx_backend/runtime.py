@@ -517,6 +517,7 @@ class MLXRuntimeFactory(RuntimeFactory):
             seed=int(config.get("seed", 0)),
             micro_batch_size=int(config.get("micro_batch_size", 8)),
             log_probs_chunk_size=int(config.get("log_probs_chunk_size", 0)),
+            recurrence_chunk_size=int(config.get("recurrence_chunk_size", 32)),
             prefill_step_size=int(config.get("prefill_step_size", 0)),
             chat_template_kwargs=chat_template_kwargs,
         )

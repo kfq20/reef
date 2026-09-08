@@ -42,23 +42,28 @@ reef:
   runtime_type: mlx
   runtime_config:
     checkpoint_dir: work/checkpoints
-    # What this run trained, kept as recorded. At the time the engine ran its
-    # backward in eval mode, where mlx-lm's GatedDeltaNet uses a Metal kernel
-    # with no vjp; 48 of this model's 64 layers are GatedDeltaNet, so the
-    # gradient reached layer 63 (the last full-attention block) and layer
-    # 62's MLP and no further — `lora_layers: 3` failed with
-    # [Primitive::vjp] Not implemented. The engine now switches the layers on
-    # the gradient's path into training mode for the backward, where the
-    # recurrence is plain differentiable ops, so this ceiling no longer
-    # applies: raise it, and add `linear_attn.in_proj_qkv` to lora_keys to
-    # adapt the GatedDeltaNet layers themselves. Each GatedDeltaNet layer the
-    # gradient crosses keeps ~3 MB of state per token for the backward on
-    # this model, and runs its recurrence one token at a time.
-    lora_layers: 2
+    # The recorded run trained 2: the engine then ran its backward in eval
+    # mode, where mlx-lm's GatedDeltaNet is a Metal kernel with no vjp, and
+    # 48 of this model's 64 layers are GatedDeltaNet, so the gradient reached
+    # layer 63 (the last full-attention block) and layer 62's MLP and no
+    # further — `lora_layers: 3` failed with [Primitive::vjp] Not
+    # implemented. The engine now puts the layers on the gradient's path into
+    # training mode for the backward, where the recurrence is plain
+    # differentiable ops, checkpointed every recurrence_chunk_size tokens, so
+    # the ceiling is unified memory: each GatedDeltaNet layer the gradient
+    # crosses costs about 5.6 MB per token and runs its recurrence one token
+    # at a time. 8 reaches layers 56–63, crossing six GatedDeltaNet layers;
+    # measured on one 700-token row at rank 256 this peaks at 25.0 GB and
+    # the backward takes 44 s on an M4 Pro with 51.5 GB. No run with this
+    # setting is recorded yet.
+    lora_layers: 8
     lora_rank: 256
     # k_proj and v_proj are adapted here, which rules out a cached prompt
     # prefill (it would freeze tensors that depend on trained weights).
     # prefill_step_size stays 0; these prompts are short.
+    # in_proj_qkv is the GatedDeltaNet layers' own projection: without it the
+    # self_attn keys match nothing on three layers in four, and those layers
+    # would only be crossed, never trained.
     lora_keys:
       - mlp.gate_proj
       - mlp.up_proj
@@ -67,6 +72,7 @@ reef:
       - self_attn.k_proj
       - self_attn.v_proj
       - self_attn.o_proj
+      - linear_attn.in_proj_qkv
     # Between the reference's 1e-5 and the 1e-4 that diverged, and chosen
     # against a measurement rather than split the difference: at 1e-5 the
     # update is aimed well (style markers lose 7.5x more log-probability than

@@ -36,6 +36,7 @@ from mlx_lm.sample_utils import make_sampler
 from mlx_lm.tuner import linear_to_lora_layers
 
 from reef.core.errors import ReefError
+from reef.train.mlx_backend.gated_delta import checkpointed_gated_delta
 from reef.train.mlx_backend.messages import prepare_messages
 from reef.train.mlx_backend.rows import DistillationRow, GenerationListener, TeacherCandidate, TrainingRow
 
@@ -96,6 +97,15 @@ class MLXEngineConfig:
     #: all: 16k positions in one pass is 16 GB, in 1k chunks it is 1 GB. Zero
     #: scores the whole sequence at once, which is fastest for short rows.
     log_probs_chunk_size: int = 0
+    #: Tokens per checkpointed span of a GatedDeltaNet recurrence during the
+    #: backward. mlx-lm's differentiable loop keeps every step's intermediates
+    #: — about 11 MB per token per crossed layer on Qwen3.8-27B, which is what
+    #: decides whether a hybrid model trains past its last full-attention
+    #: block. Checkpointing keeps one state per span and recomputes the rest,
+    #: for about half the memory and a second forward inside the backward.
+    #: Zero leaves mlx-lm's loop as it is. Irrelevant to a model without such
+    #: a layer.
+    recurrence_chunk_size: int = 32
     #: Extra values handed to the chat template, the deployment's default for
     #: every request. A reasoning model's template is the usual reason to set
     #: one: Qwen3 opens a ``<think>`` block in the generation prompt unless
@@ -121,6 +131,8 @@ class MLXEngineConfig:
             raise ValueError("lora_keys must name at least one projection")
         if self.prefill_step_size < 0 or isinstance(self.prefill_step_size, bool):
             raise ValueError("prefill_step_size must be a non-negative integer")
+        if self.recurrence_chunk_size < 0 or isinstance(self.recurrence_chunk_size, bool):
+            raise ValueError("recurrence_chunk_size must be a non-negative integer")
         if self.prefill_step_size and _lora_reaches_keys_or_values(self.lora_keys):
             # Prefilling is exact only while the cached tensors are constant
             # with respect to the trained weights. An adapted key or value
@@ -397,16 +409,20 @@ class MLXEngine:
 
         The ops loop runs one token at a time and keeps every token's
         recurrent state for the backward pass, so it is switched on only
-        where the gradient actually travels. The frozen prefix keeps the
-        kernel and its forward costs what it always did; serving and the
-        forward-only scoring passes never enter here at all. On a model
-        without such a layer, training mode changes nothing (LoRA dropout is
-        the only other mode-dependent module, and it is off by default).
+        where the gradient actually travels, and the loop itself is routed
+        through :mod:`reef.train.mlx_backend.gated_delta`, which checkpoints
+        it so that a long row crossing several such layers fits in unified
+        memory. The frozen prefix keeps the kernel and its forward costs what
+        it always did; serving and the forward-only scoring passes never
+        enter here at all. On a model without such a layer, training mode
+        changes nothing (LoRA dropout is the only other mode-dependent
+        module, and it is off by default).
         """
         for layer in self._gradient_path:
             layer.train()
         try:
-            yield
+            with checkpointed_gated_delta(self._config.recurrence_chunk_size):
+                yield
         finally:
             for layer in self._gradient_path:
                 layer.eval()

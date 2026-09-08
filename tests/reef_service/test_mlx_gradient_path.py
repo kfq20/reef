@@ -165,3 +165,77 @@ def test_without_the_switch_the_kernel_refuses_the_backward(monkeypatch) -> None
             engine._run(lambda: engine._micro_batch_gradients(engine._pack(rows())))
     finally:
         engine.close()
+
+
+# ------------------------------------------------- checkpointed recurrence
+
+
+def recurrence_inputs(length: int):
+    from mlx_lm.models import gated_delta
+
+    mx.random.seed(0)
+    batch, key_heads, value_heads, key_dim, value_dim = 2, 2, 4, 32, 32
+    q = mx.random.normal((batch, length, key_heads, key_dim))
+    k = mx.random.normal((batch, length, key_heads, key_dim))
+    v = mx.random.normal((batch, length, value_heads, value_dim))
+    g = -mx.random.uniform(shape=(batch, length, value_heads))
+    beta = mx.random.uniform(shape=(batch, length, value_heads))
+    mask = mx.array([[1] * length, [1] * (length - 17) + [0] * 17]).astype(mx.bool_)
+    return gated_delta, (q, k, v, g, beta), mask
+
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_the_checkpointed_recurrence_is_mlx_lm_s_loop_to_the_bit(masked: bool) -> None:
+    from reef.train.mlx_backend.gated_delta import checkpointed_recurrence
+
+    # 77 tokens: two full chunks of 32 and a ragged tail, with a mask that
+    # freezes one row's state partway through the last chunk.
+    gated_delta, inputs, mask = recurrence_inputs(77)
+    mask = mask if masked else None
+    checkpointed = checkpointed_recurrence(gated_delta._gated_delta_step_ops, 32)
+
+    def loss_of(recurrence):
+        def loss(q, k, v):
+            y, state = recurrence(q, k, v, *inputs[3:], None, mask)
+            return (y**2).sum() + (state**2).sum()
+
+        return mx.value_and_grad(loss, argnums=(0, 1, 2))(*inputs[:3])
+
+    reference_loss, reference_grads = loss_of(gated_delta.gated_delta_ops)
+    loss, grads = loss_of(checkpointed)
+    mx.eval(reference_loss, reference_grads, loss, grads)
+
+    assert float(loss) == float(reference_loss)
+    for expected, actual in zip(reference_grads, grads, strict=True):
+        assert float(mx.max(mx.abs(expected - actual))) == 0.0
+
+
+def test_the_recurrence_is_rerouted_only_for_the_span_of_a_backward(monkeypatch) -> None:
+    from mlx_lm.models import gated_delta
+
+    from reef.train.mlx_backend import gated_delta as reef_gated_delta
+
+    original = gated_delta.gated_delta_ops
+    engine = hybrid_engine(monkeypatch, lora_layers=6)
+    try:
+        seen: list[bool] = []
+        scoring = engine_module._token_log_probs
+
+        def observing(model, sequences, mask):
+            seen.append(gated_delta.gated_delta_ops is not original)
+            return scoring(model, sequences, mask)
+
+        monkeypatch.setattr(engine_module, "_token_log_probs", observing)
+        engine._run(lambda: engine._micro_batch_gradients(engine._pack(rows())))
+        assert seen == [True]
+        assert gated_delta.gated_delta_ops is original
+
+        with reef_gated_delta.checkpointed_gated_delta(0):
+            assert gated_delta.gated_delta_ops is original
+    finally:
+        engine.close()
+
+
+def test_a_negative_recurrence_chunk_is_refused() -> None:
+    with pytest.raises(ValueError, match="recurrence_chunk_size"):
+        MLXEngineConfig(model_path="x", recurrence_chunk_size=-1)

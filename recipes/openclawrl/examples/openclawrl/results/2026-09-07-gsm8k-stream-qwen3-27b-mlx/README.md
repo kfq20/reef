@@ -81,13 +81,18 @@ That ceiling was the engine's, not the model's. mlx-lm switches `GatedDeltaNet`
 to a loop of plain, differentiable ops in training mode, and the engine now puts
 the layers on the gradient's path into training mode for the span of each
 backward (see `MLXEngine._differentiable`). A later run can adapt as many layers
-as unified memory allows; the numbers above stand as measured with two.
+as unified memory allows; the numbers above stand as measured with two. One
+700-token row at `lora_layers: 8`, rank 256, crossing six `GatedDeltaNet` layers,
+peaks at 25.0 GB and takes 44 s for the backward on an M4 Pro.
 
 ## Configuration
 
 See [`serve.yaml`](serve.yaml). The load-bearing choices:
 
-- `lora_layers: 2`, `lora_rank: 256` — the reachable surface, measured not guessed.
+- `lora_layers: 2`, `lora_rank: 256` in the recorded run — the surface reachable then.
+  `serve.yaml` now carries `lora_layers: 8` and adapts the `GatedDeltaNet`
+  projections too (`linear_attn.in_proj_qkv`); no run with that setting is
+  recorded yet.
 - `kl_coef 0.05` (frozen-base k3 KL) + `weight_decay 0.1` — without the KL term,
   earlier runs collapsed into an unconditional tool loop; it prices the drift of
   the mass neither objective term targets.
