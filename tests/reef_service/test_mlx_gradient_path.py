@@ -167,10 +167,10 @@ def test_without_the_switch_the_kernel_refuses_the_backward(monkeypatch) -> None
         engine.close()
 
 
-# ------------------------------------------------- checkpointed recurrence
+# ------------------------------------------------- hand-written recurrence backward
 
 
-def recurrence_inputs(length: int):
+def recurrence_inputs(length: int, *, vector_gating: bool):
     from mlx_lm.models import gated_delta
 
     mx.random.seed(0)
@@ -178,36 +178,87 @@ def recurrence_inputs(length: int):
     q = mx.random.normal((batch, length, key_heads, key_dim))
     k = mx.random.normal((batch, length, key_heads, key_dim))
     v = mx.random.normal((batch, length, value_heads, value_dim))
-    g = -mx.random.uniform(shape=(batch, length, value_heads))
+    gating_shape = (batch, length, value_heads, key_dim) if vector_gating else (batch, length, value_heads)
+    g = mx.random.uniform(shape=gating_shape)
     beta = mx.random.uniform(shape=(batch, length, value_heads))
+    state = mx.random.normal((batch, value_heads, value_dim, key_dim)) * 0.1
     mask = mx.array([[1] * length, [1] * (length - 17) + [0] * 17]).astype(mx.bool_)
-    return gated_delta, (q, k, v, g, beta), mask
+    return gated_delta, (q, k, v, g, beta, state), mask
 
 
+def relative_deviation(expected: mx.array, actual: mx.array) -> float:
+    return float(mx.max(mx.abs(expected - actual)) / mx.maximum(mx.max(mx.abs(expected)), mx.array(1e-12)))
+
+
+@pytest.mark.parametrize("vector_gating", [False, True])
 @pytest.mark.parametrize("masked", [False, True])
-def test_the_checkpointed_recurrence_is_mlx_lm_s_loop_to_the_bit(masked: bool) -> None:
-    from reef.train.mlx_backend.gated_delta import checkpointed_recurrence
+def test_the_hand_written_backward_agrees_with_autodiff_through_mlx_lm_s_loop(
+    masked: bool, vector_gating: bool
+) -> None:
+    from reef.train.mlx_backend.gated_delta import chunked_recurrence
 
-    # 77 tokens: two full chunks of 32 and a ragged tail, with a mask that
-    # freezes one row's state partway through the last chunk.
-    gated_delta, inputs, mask = recurrence_inputs(77)
+    # 77 tokens: two full spans of 32 and a ragged tail; grouped queries
+    # (two key heads to four value heads); a starting state that is not
+    # zero, so its gradient is exercised; and a mask that freezes one row's
+    # state partway through the last span. The loss reads both outputs.
+    gated_delta, inputs, mask = recurrence_inputs(77, vector_gating=vector_gating)
     mask = mask if masked else None
-    checkpointed = checkpointed_recurrence(gated_delta._gated_delta_step_ops, 32)
 
     def loss_of(recurrence):
-        def loss(q, k, v):
-            y, state = recurrence(q, k, v, *inputs[3:], None, mask)
-            return (y**2).sum() + (state**2).sum()
+        def loss(q, k, v, g, beta, state):
+            y, final = recurrence(q, k, v, g, beta, state, mask)
+            # The kernel writes zeros at masked positions and the ops loop
+            # does not; the outputs there are padding, so weight them out.
+            weight = 1.0 if mask is None else mask[..., None, None].astype(y.dtype)
+            return ((y * weight) ** 2).sum() + (final**2).sum()
 
-        return mx.value_and_grad(loss, argnums=(0, 1, 2))(*inputs[:3])
+        return mx.value_and_grad(loss, argnums=(0, 1, 2, 3, 4, 5))(*inputs)
 
     reference_loss, reference_grads = loss_of(gated_delta.gated_delta_ops)
-    loss, grads = loss_of(checkpointed)
+    loss, grads = loss_of(chunked_recurrence(32))
     mx.eval(reference_loss, reference_grads, loss, grads)
 
-    assert float(loss) == float(reference_loss)
+    # float32 throughout; the residue is the kernel's summation order.
+    assert abs(float(loss) - float(reference_loss)) / abs(float(reference_loss)) < 1e-5
     for expected, actual in zip(reference_grads, grads, strict=True):
-        assert float(mx.max(mx.abs(expected - actual))) == 0.0
+        assert relative_deviation(expected, actual) < 1e-4
+
+
+def test_the_backward_keeps_one_span_of_states_rather_than_every_token() -> None:
+    from mlx_lm.models import gated_delta
+
+    from reef.train.mlx_backend.gated_delta import chunked_recurrence
+
+    # The whole point. Measured on the recurrence alone, so the number is the
+    # recurrence's: mlx-lm's loop keeps several states per token, the
+    # hand-written backward keeps a span's worth in total. A generous bound,
+    # so it fails only if the design regresses, not on allocator noise.
+    key_heads, value_heads, key_dim, value_dim, length = 4, 8, 64, 64, 256
+    state_bytes = value_heads * value_dim * key_dim * 4
+
+    def peak_of(recurrence) -> int:
+        mx.random.seed(0)
+        q = mx.random.normal((1, length, key_heads, key_dim))
+        k = mx.random.normal((1, length, key_heads, key_dim))
+        v = mx.random.normal((1, length, value_heads, value_dim))
+        g = mx.random.uniform(shape=(1, length, value_heads))
+        beta = mx.random.uniform(shape=(1, length, value_heads))
+        mx.eval(q, k, v, g, beta)
+
+        def loss(q, k, v, g, beta):
+            y, _ = recurrence(q, k, v, g, beta, None, None)
+            return (y**2).sum()
+
+        mx.reset_peak_memory()
+        base = mx.get_active_memory()
+        value, grads = mx.value_and_grad(loss, argnums=(0, 1, 2, 3, 4))(q, k, v, g, beta)
+        mx.eval(value, grads)
+        return mx.get_peak_memory() - base
+
+    loop = peak_of(gated_delta.gated_delta_ops)
+    manual = peak_of(chunked_recurrence(32))
+    assert loop > length * state_bytes  # the loop really does keep per-token states
+    assert manual < loop / 4
 
 
 def test_the_recurrence_is_rerouted_only_for_the_span_of_a_backward(monkeypatch) -> None:
@@ -230,7 +281,7 @@ def test_the_recurrence_is_rerouted_only_for_the_span_of_a_backward(monkeypatch)
         assert seen == [True]
         assert gated_delta.gated_delta_ops is original
 
-        with reef_gated_delta.checkpointed_gated_delta(0):
+        with reef_gated_delta.chunked_gated_delta(0):
             assert gated_delta.gated_delta_ops is original
     finally:
         engine.close()

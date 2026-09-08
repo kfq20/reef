@@ -49,13 +49,14 @@ reef:
     # further — `lora_layers: 3` failed with [Primitive::vjp] Not
     # implemented. The engine now puts the layers on the gradient's path into
     # training mode for the backward, where the recurrence is plain
-    # differentiable ops, checkpointed every recurrence_chunk_size tokens, so
-    # the ceiling is unified memory: each GatedDeltaNet layer the gradient
-    # crosses costs about 5.6 MB per token and runs its recurrence one token
-    # at a time. 8 reaches layers 56–63, crossing six GatedDeltaNet layers;
-    # measured on one 700-token row at rank 256 this peaks at 25.0 GB and
-    # the backward takes 44 s on an M4 Pro with 51.5 GB. No run with this
-    # setting is recorded yet.
+    # differentiable ops with a hand-written backward
+    # (reef.train.mlx_backend.gated_delta), so the ceiling is unified memory
+    # and time. 8 reaches layers 56–63, crossing six GatedDeltaNet layers;
+    # measured on one 700-token row at rank 256 this peaks at 20.5 GB and
+    # the backward takes 27.5 s on an M4 Pro with 51.5 GB. Every layer (64)
+    # fits too, at 47.5 GB and a twelve-minute backward per row — at this
+    # rank the adapter and its optimizer state are what fill memory then.
+    # No run with this setting is recorded yet.
     lora_layers: 8
     lora_rank: 256
     # k_proj and v_proj are adapted here, which rules out a cached prompt

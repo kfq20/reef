@@ -83,7 +83,8 @@ the layers on the gradient's path into training mode for the span of each
 backward (see `MLXEngine._differentiable`). A later run can adapt as many layers
 as unified memory allows; the numbers above stand as measured with two. One
 700-token row at `lora_layers: 8`, rank 256, crossing six `GatedDeltaNet` layers,
-peaks at 25.0 GB and takes 44 s for the backward on an M4 Pro.
+peaks at 20.5 GB and takes 27.5 s for the backward on an M4 Pro; all 64 layers
+peak at 47.5 GB and take twelve minutes. See [the runtime notes](mlx-runtime-notes.md).
 
 ## Configuration
 

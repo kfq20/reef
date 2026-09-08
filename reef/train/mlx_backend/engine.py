@@ -36,7 +36,7 @@ from mlx_lm.sample_utils import make_sampler
 from mlx_lm.tuner import linear_to_lora_layers
 
 from reef.core.errors import ReefError
-from reef.train.mlx_backend.gated_delta import checkpointed_gated_delta
+from reef.train.mlx_backend.gated_delta import chunked_gated_delta
 from reef.train.mlx_backend.messages import prepare_messages
 from reef.train.mlx_backend.rows import DistillationRow, GenerationListener, TeacherCandidate, TrainingRow
 
@@ -97,14 +97,16 @@ class MLXEngineConfig:
     #: all: 16k positions in one pass is 16 GB, in 1k chunks it is 1 GB. Zero
     #: scores the whole sequence at once, which is fastest for short rows.
     log_probs_chunk_size: int = 0
-    #: Tokens per checkpointed span of a GatedDeltaNet recurrence during the
-    #: backward. mlx-lm's differentiable loop keeps every step's intermediates
-    #: — about 11 MB per token per crossed layer on Qwen3.8-27B, which is what
+    #: Tokens per span of a GatedDeltaNet recurrence during the backward.
+    #: mlx-lm's differentiable loop keeps every step's intermediates — about
+    #: 10.5 MB per token per crossed layer on Qwen3.8-27B, which is what
     #: decides whether a hybrid model trains past its last full-attention
-    #: block. Checkpointing keeps one state per span and recomputes the rest,
-    #: for about half the memory and a second forward inside the backward.
-    #: Zero leaves mlx-lm's loop as it is. Irrelevant to a model without such
-    #: a layer.
+    #: block. :mod:`reef.train.mlx_backend.gated_delta` gives the recurrence a
+    #: hand-written backward instead: it keeps one state per span, recomputes
+    #: the span when it needs it, and holds about 1 MB per token. Longer
+    #: spans are slightly faster and hold proportionally more while a span is
+    #: worked on. Zero leaves mlx-lm's loop as it is. Irrelevant to a model
+    #: without such a layer.
     recurrence_chunk_size: int = 32
     #: Extra values handed to the chat template, the deployment's default for
     #: every request. A reasoning model's template is the usual reason to set
@@ -421,7 +423,7 @@ class MLXEngine:
         for layer in self._gradient_path:
             layer.train()
         try:
-            with checkpointed_gated_delta(self._config.recurrence_chunk_size):
+            with chunked_gated_delta(self._config.recurrence_chunk_size):
                 yield
         finally:
             for layer in self._gradient_path:
