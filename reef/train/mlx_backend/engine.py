@@ -449,15 +449,19 @@ class MLXEngine:
 
         **Tokens are identical to the single path** (verified greedy across
         mixed prompt lengths, so the left-padding masks the GatedDeltaNet state
-        correctly). The recorded ``rollout_log_probs`` can differ from the
-        single path by up to ~0.1 on rare tokens, because ``_make_cache`` runs
-        the batched-attention ``BatchKVCache`` while ``generate_step`` runs the
-        plain ``KVCache``, and the two kernels are not bit-identical on the
-        4-bit model. This does not touch training: the OpenClaw-RL objective's
-        importance ratio is built from the *training* forward (``ell_old``,
-        detached), not from these recorded values, which serve only the
-        staleness diagnostic. A batched rollout will read that diagnostic
-        ratio slightly off 1.0 on those tokens.
+        correctly — the two cache kernels produce bit-identical logits for the
+        same token). This method's log-softmax runs in float32, so the recorded
+        ``rollout_log_probs`` are the true log-probs of the fp16 logits, not an
+        fp16 rounding of them that would depend on the reduction order. The
+        single path records fp16 (it reads ``generate_step``'s own log-softmax),
+        so a batched and a single rollout of the same tokens can still differ by
+        an fp16 ULP on rare tokens — the single side's rounding. This does not
+        touch training: the objective's importance ratio is built from the
+        *training* forward (``ell_old``, detached), not from these recorded
+        values, which feed only the staleness diagnostic. That diagnostic is
+        computed against the fp16 training forward, so a batched rollout can read
+        it slightly off 1.0 on those tokens; making it exact would need the
+        whole log-prob pipeline in float32, which is not worth it here.
         """
         return self._run(lambda: self._generate_batch(prompts, max_tokens, temperature))
 
@@ -501,7 +505,17 @@ class MLXEngine:
         finish_reason = ["length"] * count
 
         for _ in range(limit):
-            step_log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)  # [batch, vocab]
+            # The log-softmax runs in float32. The fp16 logits are the same the
+            # single path sees (identical tokens, verified), but rounding the
+            # log-softmax in fp16 makes the recorded log-prob depend on the
+            # reduction order, so a batched decode and the single path land on
+            # different fp16 ULPs for the same token — a power-of-two jump (2**-3
+            # at this model's logit scale). Doing the reduction in float32 keeps
+            # the recorded value the true log-prob of the fp16 logits, order-
+            # independent. Sampling reads the same float32 vector; the argmax is
+            # unchanged, so tokens do not move.
+            logits_f32 = logits.astype(mx.float32)
+            step_log_probs = logits_f32 - mx.logsumexp(logits_f32, axis=-1, keepdims=True)  # [batch, vocab]
             sampled = sampler(step_log_probs)  # [batch]
             mx.eval(sampled, step_log_probs)
             for index in range(count):
