@@ -165,16 +165,14 @@ def test_generate_batch_yields_the_same_tokens_as_the_single_path() -> None:
     engine = MLXEngine(MLXEngineConfig(model_path=MODEL, lora_layers=2, max_tokens=16, seed=0))
     try:
         short = engine.render_prompt([{"role": "user", "content": "Say hi."}])
-        longer = engine.render_prompt(
-            [{"role": "user", "content": "Name three colors, then count to five."}]
-        )
+        longer = engine.render_prompt([{"role": "user", "content": "Name three colors, then count to five."}])
         assert len(short) != len(longer)  # the left-padding path is what this hits
 
         batched = engine.generate_batch([short, longer], max_tokens=16, temperature=0.0)
         singles = [engine.generate(p, max_tokens=16, temperature=0.0) for p in (short, longer)]
 
         assert len(batched) == 2
-        for batch_rollout, single_rollout in zip(batched, singles):
+        for batch_rollout, single_rollout in zip(batched, singles, strict=True):
             assert batch_rollout.output_tokens == single_rollout.output_tokens
 
         assert engine.generate_batch([], temperature=0.0) == []
