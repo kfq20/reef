@@ -449,10 +449,7 @@ class MLXEngine:
         single-sequence streaming stays on :meth:`generate_stream`.
         """
         batcher = ContinuousBatcher(self)
-        tickets = [
-            batcher.submit(prompt, max_tokens=max_tokens, temperature=temperature)
-            for prompt in prompts
-        ]
+        tickets = [batcher.submit(prompt, max_tokens=max_tokens, temperature=temperature) for prompt in prompts]
         try:
             resolved = self._run(lambda: batcher.drain_on_engine_thread())
         finally:
@@ -1302,8 +1299,7 @@ class ContinuousBatcher:
         """
         resolved: dict[object, Rollout] = {}
         while self._live or self._has_queued():
-            for ticket, rollout in self._step():
-                resolved[ticket] = rollout
+            resolved.update(self._step())
         return resolved
 
     def close(self) -> None:
@@ -1334,9 +1330,7 @@ class ContinuousBatcher:
                 live.tokens.append(token_id)
                 live.log_probs.append(float(response.logprobs[token_id]))
                 if live.capture_topk:
-                    candidates = mx.argpartition(-response.logprobs, kth=live.capture_topk - 1)[
-                        : live.capture_topk
-                    ]
+                    candidates = mx.argpartition(-response.logprobs, kth=live.capture_topk - 1)[: live.capture_topk]
                     values = response.logprobs[candidates]
                     mx.eval(candidates, values)
                     live.topk_indices.append(tuple(_as_int(value) for value in candidates))
@@ -1344,7 +1338,7 @@ class ContinuousBatcher:
             if response.finish_reason is not None:
                 live.finish_reason = response.finish_reason
                 finished.append((live.ticket, self._rollout(live)))
-                del self._live[response.uid]
+                self._live.pop(response.uid)
         return finished
 
     def _insert_queued(self) -> None:
@@ -1361,11 +1355,9 @@ class ContinuousBatcher:
         uids = self._generator.insert(
             [list(submission.prompt) for submission in pending],
             [submission.max_tokens for submission in pending],
-            samplers=[
-                make_sampler(temp=submission.temperature, top_p=top_p) for submission in pending
-            ],
+            samplers=[make_sampler(temp=submission.temperature, top_p=top_p) for submission in pending],
         )
-        for submission, uid in zip(pending, uids):
+        for submission, uid in zip(pending, uids, strict=True):
             self._live[uid] = _BatchLive(
                 ticket=submission.ticket,
                 prompt=submission.prompt,
