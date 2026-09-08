@@ -153,3 +153,30 @@ def test_streamed_pieces_are_the_rollout_text_and_a_cancelled_stream_stops_early
         assert "".join(stopped.pieces) == partial.text[: len("".join(stopped.pieces))]
     finally:
         engine.close()
+
+
+def test_generate_batch_yields_the_same_tokens_as_the_single_path() -> None:
+    """One batched decode over several prompts produces, per prompt, exactly the
+    tokens the single path would — including the left-padding of the shorter
+    prompt. Greedy makes it deterministic; the recorded log-probs can differ
+    slightly (the batched-attention cache is a different kernel), so only the
+    tokens are pinned. The GatedDeltaNet hybrid is exercised out-of-band; this
+    pins the batching logic on a model that loads fast."""
+    engine = MLXEngine(MLXEngineConfig(model_path=MODEL, lora_layers=2, max_tokens=16, seed=0))
+    try:
+        short = engine.render_prompt([{"role": "user", "content": "Say hi."}])
+        longer = engine.render_prompt(
+            [{"role": "user", "content": "Name three colors, then count to five."}]
+        )
+        assert len(short) != len(longer)  # the left-padding path is what this hits
+
+        batched = engine.generate_batch([short, longer], max_tokens=16, temperature=0.0)
+        singles = [engine.generate(p, max_tokens=16, temperature=0.0) for p in (short, longer)]
+
+        assert len(batched) == 2
+        for batch_rollout, single_rollout in zip(batched, singles):
+            assert batch_rollout.output_tokens == single_rollout.output_tokens
+
+        assert engine.generate_batch([], temperature=0.0) == []
+    finally:
+        engine.close()

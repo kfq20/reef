@@ -431,6 +431,117 @@ class MLXEngine:
         """
         return self._run(lambda: self._generate(prompt_tokens, max_tokens, temperature, listener))
 
+    def generate_batch(
+        self,
+        prompts: Sequence[Sequence[int]],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> list[Rollout]:
+        """Sample one completion for each prompt in a single batched decode.
+
+        The same per-token log-prob capture as :meth:`generate`, over a
+        left-padded ``[batch, length]`` forward. The single path stays on
+        ``generate_step`` — this is the tensor-level batch for callers that
+        have several prompts at once (grouped sampling, or concurrent
+        rollouts collected into one step). Streaming is single-sequence and
+        stays on :meth:`generate_stream`.
+
+        **Tokens are identical to the single path** (verified greedy across
+        mixed prompt lengths, so the left-padding masks the GatedDeltaNet state
+        correctly). The recorded ``rollout_log_probs`` can differ from the
+        single path by up to ~0.1 on rare tokens, because ``_make_cache`` runs
+        the batched-attention ``BatchKVCache`` while ``generate_step`` runs the
+        plain ``KVCache``, and the two kernels are not bit-identical on the
+        4-bit model. This does not touch training: the OpenClaw-RL objective's
+        importance ratio is built from the *training* forward (``ell_old``,
+        detached), not from these recorded values, which serve only the
+        staleness diagnostic. A batched rollout will read that diagnostic
+        ratio slightly off 1.0 on those tokens.
+        """
+        return self._run(lambda: self._generate_batch(prompts, max_tokens, temperature))
+
+    def _generate_batch(
+        self,
+        prompts: Sequence[Sequence[int]],
+        max_tokens: int | None,
+        temperature: float | None,
+    ) -> list[Rollout]:
+        # ``_left_pad_prompts`` and ``_make_cache`` are mlx-lm's own batch
+        # machinery: left-padding plus per-cache-type batch conversion, so the
+        # KV caches and the GatedDeltaNet ArraysCache are both masked for the
+        # padded positions. Reusing them keeps the padding correct rather than
+        # re-deriving the masks here; what this method adds is the sampled-token
+        # log-prob capture the objective needs, which ``batch_generate`` drops.
+        from mlx_lm.generate import _left_pad_prompts, _make_cache
+
+        rows = [list(prompt) for prompt in prompts]
+        if not rows:
+            return []
+        temperature = self._config.temperature if temperature is None else temperature
+        limit = self._config.max_tokens if max_tokens is None else max_tokens
+        sampler = make_sampler(temp=temperature, top_p=self._config.top_p)
+        stop_ids = set(self._tokenizer.eos_token_ids)
+        capture = self._config.capture_topk
+        count = len(rows)
+
+        max_len = max(len(row) for row in rows)
+        left_padding = [max_len - len(row) for row in rows]
+        padded = _left_pad_prompts(rows)  # [batch, max_len], zero-padded on the left
+        caches = _make_cache(self._model, mx.array(left_padding), max_kv_size=None)
+
+        # Prefill: the logits at each sequence's last position start the decode.
+        logits = self._model(padded, cache=caches)[:, -1, :]
+
+        output: list[list[int]] = [[] for _ in range(count)]
+        log_probs: list[list[float]] = [[] for _ in range(count)]
+        topk_indices: list[list[tuple[int, ...]]] = [[] for _ in range(count)]
+        topk_log_probs: list[list[tuple[float, ...]]] = [[] for _ in range(count)]
+        done = [False] * count
+        finish_reason = ["length"] * count
+
+        for _ in range(limit):
+            step_log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)  # [batch, vocab]
+            sampled = sampler(step_log_probs)  # [batch]
+            mx.eval(sampled, step_log_probs)
+            for index in range(count):
+                if done[index]:
+                    continue
+                token_id = _as_int(sampled[index])
+                if token_id in stop_ids:
+                    done[index] = True
+                    finish_reason[index] = "stop"
+                    continue
+                row_log_probs = step_log_probs[index]
+                if capture:
+                    candidates = mx.argpartition(-row_log_probs, kth=capture - 1)[:capture]
+                    values = row_log_probs[candidates]
+                    mx.eval(candidates, values)
+                    topk_indices[index].append(tuple(_as_int(value) for value in candidates))
+                    topk_log_probs[index].append(tuple(_as_float(value) for value in values))
+                output[index].append(token_id)
+                log_probs[index].append(_as_float(row_log_probs[token_id]))
+            if all(done):
+                break
+            # A finished sequence keeps sampling into the padded batch; its
+            # tokens are dropped above, so the wasted step never reaches a
+            # rollout. Shrinking the batch as sequences finish is an
+            # optimisation left for later.
+            logits = self._model(sampled[:, None], cache=caches)[:, -1, :]
+
+        return [
+            Rollout(
+                prompt_tokens=tuple(rows[index]),
+                output_tokens=tuple(output[index]),
+                rollout_log_probs=tuple(log_probs[index]),
+                text=self._tokenizer.decode(output[index]),
+                finish_reason=finish_reason[index],
+                topk_indices=tuple(topk_indices[index]),
+                topk_log_probs=tuple(topk_log_probs[index]),
+            )
+            for index in range(count)
+        ]
+
     def _generate(
         self,
         prompt_tokens: Sequence[int],
