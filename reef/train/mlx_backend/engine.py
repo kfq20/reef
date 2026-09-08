@@ -18,6 +18,7 @@ import math
 import os
 import shutil
 import tempfile
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -29,7 +30,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 from mlx_lm import load
-from mlx_lm.generate import generate_step
+from mlx_lm.generate import BatchGenerator, generate_step
 from mlx_lm.sample_utils import make_sampler
 from mlx_lm.tuner import linear_to_lora_layers
 
@@ -438,123 +439,25 @@ class MLXEngine:
         max_tokens: int | None = None,
         temperature: float | None = None,
     ) -> list[Rollout]:
-        """Sample one completion for each prompt in a single batched decode.
+        """Sample one completion per prompt, sharing a single continuous batch.
 
-        The same per-token log-prob capture as :meth:`generate`, over a
-        left-padded ``[batch, length]`` forward. The single path stays on
-        ``generate_step`` — this is the tensor-level batch for callers that
-        have several prompts at once (grouped sampling, or concurrent
-        rollouts collected into one step). Streaming is single-sequence and
-        stays on :meth:`generate_stream`.
-
-        **Tokens are identical to the single path** (verified greedy across
-        mixed prompt lengths, so the left-padding masks the GatedDeltaNet state
-        correctly — the two cache kernels produce bit-identical logits for the
-        same token). This method's log-softmax runs in float32, so the recorded
-        ``rollout_log_probs`` are the true log-probs of the fp16 logits, not an
-        fp16 rounding of them that would depend on the reduction order. The
-        single path records fp16 (it reads ``generate_step``'s own log-softmax),
-        so a batched and a single rollout of the same tokens can still differ by
-        an fp16 ULP on rare tokens — the single side's rounding. This does not
-        touch training: the objective's importance ratio is built from the
-        *training* forward (``ell_old``, detached), not from these recorded
-        values, which feed only the staleness diagnostic. That diagnostic is
-        computed against the fp16 training forward, so a batched rollout can read
-        it slightly off 1.0 on those tokens; making it exact would need the
-        whole log-prob pipeline in float32, which is not worth it here.
+        A thin driver over :class:`ContinuousBatcher`: submit every prompt and
+        drain. The batcher inserts into an in-flight ``BatchGenerator``, so the
+        prompts decode together and a finished sequence is evicted rather than
+        padded. To feed concurrent requests into one live batch, drive
+        :class:`ContinuousBatcher` directly (``submit`` then ``step``);
+        single-sequence streaming stays on :meth:`generate_stream`.
         """
-        return self._run(lambda: self._generate_batch(prompts, max_tokens, temperature))
-
-    def _generate_batch(
-        self,
-        prompts: Sequence[Sequence[int]],
-        max_tokens: int | None,
-        temperature: float | None,
-    ) -> list[Rollout]:
-        # ``_left_pad_prompts`` and ``_make_cache`` are mlx-lm's own batch
-        # machinery: left-padding plus per-cache-type batch conversion, so the
-        # KV caches and the GatedDeltaNet ArraysCache are both masked for the
-        # padded positions. Reusing them keeps the padding correct rather than
-        # re-deriving the masks here; what this method adds is the sampled-token
-        # log-prob capture the objective needs, which ``batch_generate`` drops.
-        from mlx_lm.generate import _left_pad_prompts, _make_cache
-
-        rows = [list(prompt) for prompt in prompts]
-        if not rows:
-            return []
-        temperature = self._config.temperature if temperature is None else temperature
-        limit = self._config.max_tokens if max_tokens is None else max_tokens
-        sampler = make_sampler(temp=temperature, top_p=self._config.top_p)
-        stop_ids = set(self._tokenizer.eos_token_ids)
-        capture = self._config.capture_topk
-        count = len(rows)
-
-        max_len = max(len(row) for row in rows)
-        left_padding = [max_len - len(row) for row in rows]
-        padded = _left_pad_prompts(rows)  # [batch, max_len], zero-padded on the left
-        caches = _make_cache(self._model, mx.array(left_padding), max_kv_size=None)
-
-        # Prefill: the logits at each sequence's last position start the decode.
-        logits = self._model(padded, cache=caches)[:, -1, :]
-
-        output: list[list[int]] = [[] for _ in range(count)]
-        log_probs: list[list[float]] = [[] for _ in range(count)]
-        topk_indices: list[list[tuple[int, ...]]] = [[] for _ in range(count)]
-        topk_log_probs: list[list[tuple[float, ...]]] = [[] for _ in range(count)]
-        done = [False] * count
-        finish_reason = ["length"] * count
-
-        for _ in range(limit):
-            # The log-softmax runs in float32. The fp16 logits are the same the
-            # single path sees (identical tokens, verified), but rounding the
-            # log-softmax in fp16 makes the recorded log-prob depend on the
-            # reduction order, so a batched decode and the single path land on
-            # different fp16 ULPs for the same token — a power-of-two jump (2**-3
-            # at this model's logit scale). Doing the reduction in float32 keeps
-            # the recorded value the true log-prob of the fp16 logits, order-
-            # independent. Sampling reads the same float32 vector; the argmax is
-            # unchanged, so tokens do not move.
-            logits_f32 = logits.astype(mx.float32)
-            step_log_probs = logits_f32 - mx.logsumexp(logits_f32, axis=-1, keepdims=True)  # [batch, vocab]
-            sampled = sampler(step_log_probs)  # [batch]
-            mx.eval(sampled, step_log_probs)
-            for index in range(count):
-                if done[index]:
-                    continue
-                token_id = _as_int(sampled[index])
-                if token_id in stop_ids:
-                    done[index] = True
-                    finish_reason[index] = "stop"
-                    continue
-                row_log_probs = step_log_probs[index]
-                if capture:
-                    candidates = mx.argpartition(-row_log_probs, kth=capture - 1)[:capture]
-                    values = row_log_probs[candidates]
-                    mx.eval(candidates, values)
-                    topk_indices[index].append(tuple(_as_int(value) for value in candidates))
-                    topk_log_probs[index].append(tuple(_as_float(value) for value in values))
-                output[index].append(token_id)
-                log_probs[index].append(_as_float(row_log_probs[token_id]))
-            if all(done):
-                break
-            # A finished sequence keeps sampling into the padded batch; its
-            # tokens are dropped above, so the wasted step never reaches a
-            # rollout. Shrinking the batch as sequences finish is an
-            # optimisation left for later.
-            logits = self._model(sampled[:, None], cache=caches)[:, -1, :]
-
-        return [
-            Rollout(
-                prompt_tokens=tuple(rows[index]),
-                output_tokens=tuple(output[index]),
-                rollout_log_probs=tuple(log_probs[index]),
-                text=self._tokenizer.decode(output[index]),
-                finish_reason=finish_reason[index],
-                topk_indices=tuple(topk_indices[index]),
-                topk_log_probs=tuple(topk_log_probs[index]),
-            )
-            for index in range(count)
+        batcher = ContinuousBatcher(self)
+        tickets = [
+            batcher.submit(prompt, max_tokens=max_tokens, temperature=temperature)
+            for prompt in prompts
         ]
+        try:
+            resolved = self._run(lambda: batcher.drain_on_engine_thread())
+        finally:
+            batcher.close()
+        return [resolved[ticket] for ticket in tickets]
 
     def _generate(
         self,
@@ -1306,10 +1209,186 @@ class MLXEngine:
         self._apply_adapter(loaded)
 
 
+@dataclass
+class _BatchSubmission:
+    """A prompt queued for the batch, and the ticket its rollout comes back on."""
+
+    ticket: object
+    prompt: tuple[int, ...]
+    max_tokens: int
+    temperature: float
+    capture_topk: int
+
+
+@dataclass
+class _BatchLive:
+    """One sequence being decoded in the live batch, accumulating its rollout."""
+
+    ticket: object
+    prompt: tuple[int, ...]
+    capture_topk: int
+    tokens: list[int] = field(default_factory=list)
+    log_probs: list[float] = field(default_factory=list)
+    topk_indices: list[tuple[int, ...]] = field(default_factory=list)
+    topk_log_probs: list[tuple[float, ...]] = field(default_factory=list)
+    finish_reason: str = "length"
+
+
+class ContinuousBatcher:
+    """Continuous batching over mlx-lm's ``BatchGenerator``.
+
+    ``BatchGenerator`` is the continuous-batching engine: it inserts prompts
+    into a running batch and evicts sequences as they finish, so a completed
+    one is never padded through to the batch's end. What it does not surface
+    through the ``batch_generate`` convenience is the per-token log-prob the
+    OpenClaw-RL objective's diagnostic reads and the top-k the OPD candidate set
+    needs — but each ``Response`` it yields carries the step's full log-softmax
+    (``response.logprobs``), so this reads them straight off it.
+
+    ``submit`` queues a prompt from any thread and returns a ticket. ``step``
+    runs one generation round on the engine's MLX thread — draining the queue
+    into the live batch and returning the rollouts that finished that round.
+    Concurrent callers therefore share one decode. All MLX work stays on the
+    engine's single thread; only the submission queue is touched from outside
+    it, under a lock.
+    """
+
+    def __init__(self, engine: MLXEngine) -> None:
+        self._engine = engine
+        self._generator: Any = None
+        self._queue: list[_BatchSubmission] = []
+        self._queue_lock = threading.Lock()
+        self._live: dict[int, _BatchLive] = {}
+
+    def submit(
+        self,
+        prompt: Sequence[int],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        capture_topk: int | None = None,
+    ) -> object:
+        """Queue a prompt; the returned ticket claims its rollout. Callable from
+        any thread — the prompt enters the batch on the next :meth:`step`.
+        """
+        config = self._engine._config
+        submission = _BatchSubmission(
+            ticket=object(),
+            prompt=tuple(prompt),
+            max_tokens=config.max_tokens if max_tokens is None else max_tokens,
+            temperature=config.temperature if temperature is None else temperature,
+            capture_topk=config.capture_topk if capture_topk is None else capture_topk,
+        )
+        with self._queue_lock:
+            self._queue.append(submission)
+        return submission.ticket
+
+    def has_work(self) -> bool:
+        """Whether anything is queued or still decoding."""
+        with self._queue_lock:
+            return bool(self._queue) or bool(self._live)
+
+    def step(self) -> list[tuple[object, Rollout]]:
+        """One generation round on the engine thread; its finished rollouts as
+        ``(ticket, rollout)``. This is the hook a service pumps between training
+        steps so generation and training interleave on the one MLX thread.
+        """
+        return self._engine._run(self._step)
+
+    def drain_on_engine_thread(self) -> dict[object, Rollout]:
+        """Run everything submitted so far to completion, returning a rollout per
+        ticket. Must run on the engine thread — call it through ``engine._run``
+        (:meth:`MLXEngine.generate_batch` does).
+        """
+        resolved: dict[object, Rollout] = {}
+        while self._live or self._has_queued():
+            for ticket, rollout in self._step():
+                resolved[ticket] = rollout
+        return resolved
+
+    def close(self) -> None:
+        """Release the generator's wired-memory limit. Idempotent."""
+        if self._generator is not None:
+            generator, self._generator = self._generator, None
+            self._engine._run(generator.close)
+
+    # ------------------------------------------------------ engine-thread only
+
+    def _has_queued(self) -> bool:
+        with self._queue_lock:
+            return bool(self._queue)
+
+    def _step(self) -> list[tuple[object, Rollout]]:
+        self._insert_queued()
+        if not self._live:
+            return []
+        finished: list[tuple[object, Rollout]] = []
+        for response in self._generator.next_generated():
+            live = self._live.get(response.uid)
+            if live is None:
+                continue
+            # The stop token is not part of the reply — the single path breaks
+            # without recording it. A length finish keeps its last token.
+            if response.finish_reason != "stop":
+                token_id = int(response.token)
+                live.tokens.append(token_id)
+                live.log_probs.append(float(response.logprobs[token_id]))
+                if live.capture_topk:
+                    candidates = mx.argpartition(-response.logprobs, kth=live.capture_topk - 1)[
+                        : live.capture_topk
+                    ]
+                    values = response.logprobs[candidates]
+                    mx.eval(candidates, values)
+                    live.topk_indices.append(tuple(_as_int(value) for value in candidates))
+                    live.topk_log_probs.append(tuple(_as_float(value) for value in values))
+            if response.finish_reason is not None:
+                live.finish_reason = response.finish_reason
+                finished.append((live.ticket, self._rollout(live)))
+                del self._live[response.uid]
+        return finished
+
+    def _insert_queued(self) -> None:
+        with self._queue_lock:
+            pending, self._queue = self._queue, []
+        if not pending:
+            return
+        if self._generator is None:
+            self._generator = BatchGenerator(
+                self._engine._model,
+                stop_tokens=[[token] for token in self._engine._tokenizer.eos_token_ids],
+            )
+        top_p = self._engine._config.top_p
+        uids = self._generator.insert(
+            [list(submission.prompt) for submission in pending],
+            [submission.max_tokens for submission in pending],
+            samplers=[
+                make_sampler(temp=submission.temperature, top_p=top_p) for submission in pending
+            ],
+        )
+        for submission, uid in zip(pending, uids):
+            self._live[uid] = _BatchLive(
+                ticket=submission.ticket,
+                prompt=submission.prompt,
+                capture_topk=submission.capture_topk,
+            )
+
+    def _rollout(self, live: _BatchLive) -> Rollout:
+        return Rollout(
+            prompt_tokens=live.prompt,
+            output_tokens=tuple(live.tokens),
+            rollout_log_probs=tuple(live.log_probs),
+            text=self._engine._tokenizer.decode(live.tokens),
+            finish_reason=live.finish_reason,
+            topk_indices=tuple(live.topk_indices),
+            topk_log_probs=tuple(live.topk_log_probs),
+        )
+
+
 __all__ = [
     "ADAPTER_CONFIG",
     "ADAPTER_WEIGHTS",
     "PROVENANCE",
+    "ContinuousBatcher",
     "DistillationRow",
     "MLXEngine",
     "MLXEngineConfig",
