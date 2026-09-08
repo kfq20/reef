@@ -163,9 +163,16 @@ class MLXInferenceBackend(InferenceBackend):
     def __init__(self, runtime: Any) -> None:
         self._runtime = runtime
         # MLX evaluates on one process-wide stream, and training mutates the
-        # same parameters generation reads. One lock keeps concurrent HTTP
-        # requests from interleaving inside the engine.
-        self._lock = asyncio.Lock()
+        # same parameters generation reads. Buffered completions share one
+        # continuous batch through the engine's scheduler, so concurrent
+        # requests decode together rather than serializing; this lock keeps a
+        # streamed completion and the batch pump — the two ways of driving the
+        # engine — from running against it at once.
+        self._engine_lock = asyncio.Lock()
+        # Each buffered request submits a prompt and waits on the future its
+        # ticket resolves; one pump advances the shared batch and resolves them.
+        self._futures: dict[object, asyncio.Future[Any]] = {}
+        self._pump_task: asyncio.Task[None] | None = None
 
     async def inference(
         self,
@@ -179,8 +186,8 @@ class MLXInferenceBackend(InferenceBackend):
             # not SSE; the service routes streams to ``inference_stream``.
             raise UpstreamStatusError("a streaming completion is served by inference_stream", status=400)
         request = self._parse_request(path, payload)
-        async with self._lock:
-            rollout, opens_reasoning = await asyncio.to_thread(self._generate, request)
+        prompt_tokens, opens_reasoning = await asyncio.to_thread(self._render, request)
+        rollout = await self._submit(prompt_tokens, request)
         if not rollout.output_tokens:
             # A completion with no response tokens can never be a policy
             # sample: `policy_row_violation` rejects an empty loss mask, the
@@ -189,6 +196,49 @@ class MLXInferenceBackend(InferenceBackend):
             # Fail the request instead, so the caller retries a rollout.
             raise UpstreamStatusError("the model produced no response tokens", status=502)
         return self._response(payload, rollout, request.parser, force_reasoning=opens_reasoning)
+
+    async def _submit(self, prompt_tokens: Sequence[int], request: _ChatRequest) -> Any:
+        """Join the shared batch and await this request's rollout."""
+        engine = self._runtime.engine
+        ticket = engine.submit_rollout(prompt_tokens, max_tokens=request.max_tokens, temperature=request.temperature)
+        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        self._futures[ticket] = future
+        self._ensure_pump()
+        return await future
+
+    def _ensure_pump(self) -> None:
+        """Guarantee a pump is draining the batch for the queued tickets."""
+        if self._pump_task is None or self._pump_task.done():
+            self._pump_task = asyncio.ensure_future(self._pump())
+
+    async def _pump(self) -> None:
+        """Advance the shared batch until it empties, resolving each rollout.
+
+        Held under ``_engine_lock`` so a streamed completion never drives the
+        engine mid-round. On the way out the loop re-checks for work a request
+        may have queued in the exit window, so no ticket is ever stranded.
+        """
+        while True:
+            async with self._engine_lock:
+                engine = self._runtime.engine
+                while engine.rollouts_pending():
+                    try:
+                        finished = await asyncio.to_thread(engine.pump_rollouts)
+                    except Exception as exc:
+                        self._fail_pending(exc)
+                        return
+                    for ticket, rollout in finished:
+                        waiter = self._futures.pop(ticket, None)
+                        if waiter is not None and not waiter.done():
+                            waiter.set_result(rollout)
+            if not self._runtime.engine.rollouts_pending():
+                return
+
+    def _fail_pending(self, exc: BaseException) -> None:
+        pending, self._futures = self._futures, {}
+        for waiter in pending.values():
+            if not waiter.done():
+                waiter.set_exception(exc)
 
     async def inference_stream(
         self,
@@ -263,13 +313,6 @@ class MLXInferenceBackend(InferenceBackend):
         )
         return prompt_tokens, prompt_opens_reasoning(engine.tokenizer, prompt_tokens)
 
-    def _generate(self, request: _ChatRequest) -> tuple[Any, bool]:
-        prompt_tokens, opens_reasoning = self._render(request)
-        rollout = self._runtime.engine.generate(
-            prompt_tokens, max_tokens=request.max_tokens, temperature=request.temperature
-        )
-        return rollout, opens_reasoning
-
     async def _stream_chunks(
         self,
         payload: Mapping[str, Any],
@@ -288,7 +331,7 @@ class MLXInferenceBackend(InferenceBackend):
                 {**common, "choices": [{"index": 0, "delta": dict(delta), "finish_reason": finish_reason, **extra}]}
             )
 
-        async with self._lock:
+        async with self._engine_lock:
             engine = self._runtime.engine
             prompt_tokens, opens_reasoning = await asyncio.to_thread(self._render, request)
             marker = None if request.parser is None else request.parser.tool_call_start

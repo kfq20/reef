@@ -436,6 +436,10 @@ class _FakeEngineForServing:
         self.pieces = list(pieces) if pieces is not None else [text[: len(text) // 2], text[len(text) // 2 :]]
         self.streamed: list[str] = []
         self.cancelled_after: int | None = None
+        # Tickets submitted for the serving batch; the pump hands each the
+        # canned rollout, standing in for the engine's ContinuousBatcher.
+        self._batch: list[object] = []
+        self.pump_calls = 0
 
     def next_runtime_load_id(self) -> str:
         self.publications += 1
@@ -448,6 +452,20 @@ class _FakeEngineForServing:
 
     def generate(self, prompt_tokens, *, max_tokens=None, temperature=None):
         return self._rollout
+
+    def submit_rollout(self, prompt_tokens, *, max_tokens=None, temperature=None):
+        ticket = object()
+        self._batch.append(ticket)
+        return ticket
+
+    def rollouts_pending(self):
+        return bool(self._batch)
+
+    def pump_rollouts(self):
+        self.pump_calls += 1
+        finished = [(ticket, self._rollout) for ticket in self._batch]
+        self._batch = []
+        return finished
 
     def generate_stream(self, prompt_tokens, *, listener, max_tokens=None, temperature=None):
         for index, piece in enumerate(self.pieces):
@@ -485,6 +503,54 @@ def test_a_served_response_carries_the_tensors_that_make_it_trainable() -> None:
     assert training["loss_mask"] == [1, 1]
     assert training["rollout_log_probs"] == [-0.5, -0.25]
     assert training["runtime_load_id"] == response["choices"][0]["meta_info"]["runtime_load_id"]
+
+
+@pytest.mark.unit
+def test_concurrent_completions_share_the_pump_and_all_resolve() -> None:
+    """Buffered requests join one continuous batch through the engine scheduler.
+
+    Each request submits a ticket and waits on a future; a single pump drains
+    the shared batch and resolves them, so concurrent rollouts decode together
+    instead of serializing. Every waiter must get its response, and once the
+    batch empties the pump has to restart for the next wave.
+    """
+    import asyncio
+
+    from reef.artifact.artifact import Artifact
+    from reef.train.mlx_backend.inference import MLXInferenceBackend
+
+    engine = _FakeEngineForServing(_FakeRollout())
+    backend = MLXInferenceBackend(MLXRuntime(engine, checkpoint_dir="/tmp/reef-mlx-pump-test"))
+
+    async def wave(n: int) -> list[dict]:
+        calls = [
+            backend.inference(
+                Artifact.local(Path("/tmp")),
+                "/v1/chat/completions",
+                {"messages": [{"role": "user", "content": f"q{i}"}]},
+            )
+            for i in range(n)
+        ]
+        return await asyncio.gather(*calls)
+
+    async def run() -> None:
+        first = await wave(4)
+        assert len(first) == 4
+        # Every concurrent request resolved with the trainable record intact.
+        assert all(r["training"]["tokens"] == [11, 12, 13, 21, 22] for r in first)
+        # The pump ran, and never more than once per request — the batch is
+        # drained in shared rounds, not one serial generation each.
+        assert 1 <= engine.pump_calls <= 4
+
+        # A second wave after the first drained proves the pump restarts rather
+        # than exiting for good once the batch first empties.
+        before = engine.pump_calls
+        second = await wave(3)
+        assert len(second) == 3
+        assert all(r["training"]["response_length"] == 2 for r in second)
+        assert engine.pump_calls > before
+
+    asyncio.run(run())
 
 
 @pytest.mark.unit

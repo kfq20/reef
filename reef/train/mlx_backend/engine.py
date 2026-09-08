@@ -508,6 +508,53 @@ class MLXEngine:
             batcher.close()
         return [resolved[ticket] for ticket in tickets]
 
+    # ------------------------------------------------ continuous serving batch
+
+    def _serving_batcher(self) -> ContinuousBatcher:
+        """The long-lived batcher the serving pump submits into.
+
+        One per engine, created on first use: it keeps a single
+        ``BatchGenerator`` alive across requests so a completion inserted while
+        others are mid-flight joins the running batch instead of starting a new
+        one. Distinct from :meth:`generate_batch`'s ephemeral batcher, which
+        drains a fixed set of prompts on the engine thread in one call.
+        """
+        batcher = getattr(self, "_serving_batch", None)
+        if batcher is None:
+            batcher = ContinuousBatcher(self)
+            self._serving_batch = batcher
+        return batcher
+
+    def submit_rollout(
+        self,
+        prompt_tokens: Sequence[int],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> object:
+        """Queue one completion for the serving batch; the ticket claims it.
+
+        Thread-safe and non-blocking: the prompt enters the running batch on
+        the next :meth:`pump_rollouts`. A backend fans concurrent requests in
+        through this and pumps them together, so independent rollouts arriving
+        at once share a single decode instead of serializing.
+        """
+        return self._serving_batcher().submit(prompt_tokens, max_tokens=max_tokens, temperature=temperature)
+
+    def rollouts_pending(self) -> bool:
+        """Whether the serving batch has queued or in-flight completions."""
+        return self._serving_batcher().has_work()
+
+    def pump_rollouts(self) -> list[tuple[object, Rollout]]:
+        """Advance the serving batch one round; the rollouts that finished it.
+
+        Runs on the engine thread. Each round inserts newly queued prompts and
+        decodes one token for every live sequence, so calling it in a loop
+        while :meth:`rollouts_pending` holds drains the batch — and a submit
+        between rounds still joins the same decode.
+        """
+        return self._serving_batcher().step()
+
     def _generate(
         self,
         prompt_tokens: Sequence[int],
