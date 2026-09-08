@@ -97,17 +97,26 @@ class MLXEngineConfig:
     #: all: 16k positions in one pass is 16 GB, in 1k chunks it is 1 GB. Zero
     #: scores the whole sequence at once, which is fastest for short rows.
     log_probs_chunk_size: int = 0
-    #: Tokens per span of a GatedDeltaNet recurrence during the backward.
-    #: mlx-lm's differentiable loop keeps every step's intermediates — about
-    #: 10.5 MB per token per crossed layer on Qwen3.8-27B, which is what
-    #: decides whether a hybrid model trains past its last full-attention
-    #: block. :mod:`reef.train.mlx_backend.gated_delta` gives the recurrence a
-    #: hand-written backward instead: it keeps one state per span, recomputes
-    #: the span when it needs it, and holds about 1 MB per token. Longer
-    #: spans are slightly faster and hold proportionally more while a span is
-    #: worked on. Zero leaves mlx-lm's loop as it is. Irrelevant to a model
-    #: without such a layer.
-    recurrence_chunk_size: int = 32
+    #: Tokens per chunk of a GatedDeltaNet recurrence during training. mlx-lm
+    #: runs that recurrence one token at a time, and differentiating its loop
+    #: keeps several state matrices per token per crossed layer — about
+    #: 10.5 MB a token on Qwen3.8-27B, which is what decides whether a hybrid
+    #: model trains past its last full-attention block, and a chain of tiny
+    #: kernels that is slow in both directions.
+    #: :mod:`reef.train.mlx_backend.gated_delta` runs the chunkwise form
+    #: instead — matrix products within a chunk, one state passed between
+    #: chunks — so both the memory and the sequential steps are per chunk.
+    #: 64 is the reference implementation's choice. Zero leaves mlx-lm's loop
+    #: as it is. Irrelevant to a model without such a layer.
+    recurrence_chunk_size: int = 64
+    #: Recompute each adapted layer's forward during the backward instead of
+    #: keeping its activations. Trades about a third more time per step for
+    #: activation memory that no longer grows with the number of adapted
+    #: layers, which is what lets every layer of a large model train at
+    #: once: without it, all 64 layers of Qwen3.8-27B on a 700-token row
+    #: hold 42 GB, most of it activations. Off by default; a handful of
+    #: layers does not need it and is faster without.
+    checkpoint_layers: bool = False
     #: Extra values handed to the chat template, the deployment's default for
     #: every request. A reasoning model's template is the usual reason to set
     #: one: Qwen3 opens a ``<think>`` block in the generation prompt unless
@@ -285,6 +294,36 @@ def _gradient_path_layers(model: nn.Module) -> list[nn.Module]:
     return layers[min(trainable) :]
 
 
+@contextmanager
+def _checkpointed_layers(layers: Sequence[nn.Module]) -> Iterator[None]:
+    """Run the given layers under ``mx.checkpoint`` for the span of a backward.
+
+    A checkpointed layer keeps its inputs and recomputes its forward when the
+    backward needs the activations, so those stop accumulating layer by
+    layer. Python resolves ``layer(x)`` on the class, so this is done the way
+    mlx-lm's trainer does it, by wrapping the class's ``__call__`` — but for
+    the span of one backward and put back after, so serving and every
+    forward-only pass run the unwrapped layer.
+    """
+    classes = {type(layer) for layer in layers}
+    originals = {cls: cls.__call__ for cls in classes}
+    for cls, call in originals.items():
+
+        def checkpointed(module, *args, call=call, **kwargs):
+            def inner(params, *args, **kwargs):
+                module.update(params)
+                return call(module, *args, **kwargs)
+
+            return mx.checkpoint(inner)(module.trainable_parameters(), *args, **kwargs)
+
+        cls.__call__ = checkpointed
+    try:
+        yield
+    finally:
+        for cls, call in originals.items():
+            cls.__call__ = call
+
+
 def _lora_reaches_keys_or_values(lora_keys: Sequence[str]) -> bool:
     """Whether the adapter changes what earlier positions contribute.
 
@@ -423,7 +462,10 @@ class MLXEngine:
         for layer in self._gradient_path:
             layer.train()
         try:
-            with chunked_gated_delta(self._config.recurrence_chunk_size):
+            with (
+                chunked_gated_delta(self._config.recurrence_chunk_size),
+                _checkpointed_layers(self._gradient_path if self._config.checkpoint_layers else []),
+            ):
                 yield
         finally:
             for layer in self._gradient_path:

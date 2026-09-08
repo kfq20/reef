@@ -78,22 +78,22 @@ parameters. Learning two layers of a 27B was the whole difficulty; the KL-to-bas
 term below is what kept those two layers from wandering.
 
 That ceiling was the engine's, not the model's. mlx-lm switches `GatedDeltaNet`
-to a loop of plain, differentiable ops in training mode, and the engine now puts
-the layers on the gradient's path into training mode for the span of each
-backward (see `MLXEngine._differentiable`). A later run can adapt as many layers
-as unified memory allows; the numbers above stand as measured with two. One
-700-token row at `lora_layers: 8`, rank 256, crossing six `GatedDeltaNet` layers,
-peaks at 20.5 GB and takes 27.5 s for the backward on an M4 Pro; all 64 layers
-peak at 47.5 GB and take twelve minutes. See [the runtime notes](mlx-runtime-notes.md).
+to a loop of plain, differentiable ops in training mode; the engine now puts the
+layers on the gradient's path into training mode for the span of each backward
+(see `MLXEngine._differentiable`) and runs the recurrence there in its chunkwise
+form, which is what makes the backward both fit and finish. The numbers above
+stand as measured with two layers. One 700-token row over all 64 layers at rank
+64, with `checkpoint_layers`, peaks at 20.1 GB and takes 32 s for the backward on
+an M4 Pro. See [the runtime notes](mlx-runtime-notes.md).
 
 ## Configuration
 
 See [`serve.yaml`](serve.yaml). The load-bearing choices:
 
 - `lora_layers: 2`, `lora_rank: 256` in the recorded run — the surface reachable then.
-  `serve.yaml` now carries `lora_layers: 8` and adapts the `GatedDeltaNet`
-  projections too (`linear_attn.in_proj_qkv`); no run with that setting is
-  recorded yet.
+  `serve.yaml` now carries every layer (`lora_layers: 64`, `lora_rank: 64`,
+  `checkpoint_layers: true`) and adapts the `GatedDeltaNet` projections too
+  (`linear_attn.in_proj_qkv`); no run with that setting is recorded yet.
 - `kl_coef 0.05` (frozen-base k3 KL) + `weight_decay 0.1` — without the KL term,
   earlier runs collapsed into an unconditional tool loop; it prices the drift of
   the mass neither objective term targets.

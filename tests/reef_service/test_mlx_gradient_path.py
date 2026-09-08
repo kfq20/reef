@@ -167,19 +167,24 @@ def test_without_the_switch_the_kernel_refuses_the_backward(monkeypatch) -> None
         engine.close()
 
 
-# ------------------------------------------------- hand-written recurrence backward
+# ------------------------------------------------------ chunkwise recurrence
 
 
-def recurrence_inputs(length: int, *, vector_gating: bool):
+def recurrence_inputs(length: int):
     from mlx_lm.models import gated_delta
 
     mx.random.seed(0)
     batch, key_heads, value_heads, key_dim, value_dim = 2, 2, 4, 32, 32
-    q = mx.random.normal((batch, length, key_heads, key_dim))
-    k = mx.random.normal((batch, length, key_heads, key_dim))
+    # Queries and keys as the model hands them over: RMS-normalised and
+    # scaled by 1/sqrt(Dk), so a key has unit norm. The delta rule is only
+    # stable for such keys; on raw Gaussians the state explodes within a few
+    # tokens and the comparison is between two overflows.
+    scale = key_dim**-0.5
+    q = scale**2 * mx.fast.rms_norm(mx.random.normal((batch, length, key_heads, key_dim)), None, 1e-6)
+    k = scale * mx.fast.rms_norm(mx.random.normal((batch, length, key_heads, key_dim)), None, 1e-6)
     v = mx.random.normal((batch, length, value_heads, value_dim))
-    gating_shape = (batch, length, value_heads, key_dim) if vector_gating else (batch, length, value_heads)
-    g = mx.random.uniform(shape=gating_shape)
+    # A decay in (0.5, 1], as the model's is a decay in (0, 1].
+    g = mx.random.uniform(shape=(batch, length, value_heads)) * 0.5 + 0.5
     beta = mx.random.uniform(shape=(batch, length, value_heads))
     state = mx.random.normal((batch, value_heads, value_dim, key_dim)) * 0.1
     mask = mx.array([[1] * length, [1] * (length - 17) + [0] * 17]).astype(mx.bool_)
@@ -190,24 +195,22 @@ def relative_deviation(expected: mx.array, actual: mx.array) -> float:
     return float(mx.max(mx.abs(expected - actual)) / mx.maximum(mx.max(mx.abs(expected)), mx.array(1e-12)))
 
 
-@pytest.mark.parametrize("vector_gating", [False, True])
+@pytest.mark.parametrize("chunk", [64, 16])
 @pytest.mark.parametrize("masked", [False, True])
-def test_the_hand_written_backward_agrees_with_autodiff_through_mlx_lm_s_loop(
-    masked: bool, vector_gating: bool
-) -> None:
+def test_the_chunkwise_recurrence_agrees_with_mlx_lm_s_loop_in_value_and_gradient(masked: bool, chunk: int) -> None:
     from reef.train.mlx_backend.gated_delta import chunked_recurrence
 
-    # 77 tokens: two full spans of 32 and a ragged tail; grouped queries
-    # (two key heads to four value heads); a starting state that is not
-    # zero, so its gradient is exercised; and a mask that freezes one row's
-    # state partway through the last span. The loss reads both outputs.
-    gated_delta, inputs, mask = recurrence_inputs(77, vector_gating=vector_gating)
+    # 77 tokens: whole chunks and a ragged tail that is padded; grouped
+    # queries (two key heads to four value heads); a starting state that is
+    # not zero, so its gradient is exercised; and a mask that freezes one
+    # row's state partway through. The loss reads both outputs.
+    gated_delta, inputs, mask = recurrence_inputs(77)
     mask = mask if masked else None
 
     def loss_of(recurrence):
         def loss(q, k, v, g, beta, state):
             y, final = recurrence(q, k, v, g, beta, state, mask)
-            # The kernel writes zeros at masked positions and the ops loop
+            # The chunkwise form emits zeros at masked positions and the loop
             # does not; the outputs there are padding, so weight them out.
             weight = 1.0 if mask is None else mask[..., None, None].astype(y.dtype)
             return ((y * weight) ** 2).sum() + (final**2).sum()
@@ -215,33 +218,81 @@ def test_the_hand_written_backward_agrees_with_autodiff_through_mlx_lm_s_loop(
         return mx.value_and_grad(loss, argnums=(0, 1, 2, 3, 4, 5))(*inputs)
 
     reference_loss, reference_grads = loss_of(gated_delta.gated_delta_ops)
-    loss, grads = loss_of(chunked_recurrence(32))
+    loss, grads = loss_of(chunked_recurrence(chunk))
     mx.eval(reference_loss, reference_grads, loss, grads)
 
-    # float32 throughout; the residue is the kernel's summation order.
-    assert abs(float(loss) - float(reference_loss)) / abs(float(reference_loss)) < 1e-5
+    # float32 throughout; the residue is a different association of the
+    # same sums, larger for the larger chunk.
+    assert abs(float(loss) - float(reference_loss)) / abs(float(reference_loss)) < 1e-4
     for expected, actual in zip(reference_grads, grads, strict=True):
-        assert relative_deviation(expected, actual) < 1e-4
+        assert relative_deviation(expected, actual) < 1e-3
 
 
-def test_the_backward_keeps_one_span_of_states_rather_than_every_token() -> None:
+def test_the_chunkwise_recurrence_survives_keys_that_barely_change_between_tokens() -> None:
+    from reef.train.mlx_backend.gated_delta import chunked_recurrence
+
+    # A model's keys are close from one token to the next, which is where a
+    # careless inversion of the UT transform (a Neumann series by repeated
+    # squaring) cancels catastrophically: it held on random keys and gave
+    # states of 1e35 on Qwen3.8's. Keys here are one direction plus a little
+    # noise, over a full chunk of 64 and a bit more.
+    gated_delta, (q, _, v, _, _, state), _ = recurrence_inputs(77)
+    mx.random.seed(1)
+    direction = mx.random.normal((1, 1, 2, 32))
+    k = 32**-0.5 * mx.fast.rms_norm(direction + 0.02 * mx.random.normal((2, 77, 2, 32)), None, 1e-6)
+    # Writes that are nearly whole and decay that is nearly none, so nothing
+    # damps the cancellation.
+    beta = 0.9 + 0.1 * mx.random.uniform(shape=(2, 77, 4))
+    g = 0.95 + 0.05 * mx.random.uniform(shape=(2, 77, 4))
+
+    def loss_of(recurrence):
+        def loss(q, k, v, g, beta, state):
+            y, final = recurrence(q, k, v, g, beta, state, None)
+            return (y**2).sum() + (final**2).sum()
+
+        return mx.value_and_grad(loss, argnums=(0, 1, 2, 3, 4, 5))(q, k, v, g, beta, state)
+
+    reference_loss, reference_grads = loss_of(gated_delta.gated_delta_ops)
+    loss, grads = loss_of(chunked_recurrence(64))
+    mx.eval(reference_loss, reference_grads, loss, grads)
+    assert abs(float(loss) - float(reference_loss)) / abs(float(reference_loss)) < 1e-4
+    for expected, actual in zip(reference_grads, grads, strict=True):
+        assert relative_deviation(expected, actual) < 1e-3
+
+
+def test_per_column_gating_falls_back_to_mlx_lm_s_loop() -> None:
+    from reef.train.mlx_backend.gated_delta import chunked_recurrence
+
+    gated_delta, (q, k, v, _, beta, state), mask = recurrence_inputs(40)
+    g = mx.random.uniform(shape=(2, 40, 4, 32)) * 0.5 + 0.5
+    expected = gated_delta.gated_delta_ops(q, k, v, g, beta, state, mask)
+    actual = chunked_recurrence(64)(q, k, v, g, beta, state, mask)
+    mx.eval(expected, actual)
+    for e, a in zip(expected, actual, strict=True):
+        assert float(mx.max(mx.abs(e - a))) == 0.0
+
+
+def test_the_backward_keeps_one_state_per_chunk_rather_than_several_per_token() -> None:
     from mlx_lm.models import gated_delta
 
     from reef.train.mlx_backend.gated_delta import chunked_recurrence
 
     # The whole point. Measured on the recurrence alone, so the number is the
     # recurrence's: mlx-lm's loop keeps several states per token, the
-    # hand-written backward keeps a span's worth in total. A generous bound,
-    # so it fails only if the design regresses, not on allocator noise.
-    key_heads, value_heads, key_dim, value_dim, length = 4, 8, 64, 64, 256
+    # chunkwise form a state per chunk. A generous bound, so it fails only
+    # if the design regresses, not on allocator noise.
+    # Head shape of the real thing (Qwen3.8's is 48 such heads), so the
+    # per-token states are what dominate the loop, as they do in training.
+    key_heads, value_heads, key_dim, value_dim, length = 4, 8, 128, 128, 512
     state_bytes = value_heads * value_dim * key_dim * 4
 
     def peak_of(recurrence) -> int:
         mx.random.seed(0)
-        q = mx.random.normal((1, length, key_heads, key_dim))
-        k = mx.random.normal((1, length, key_heads, key_dim))
+        scale = key_dim**-0.5
+        q = scale**2 * mx.fast.rms_norm(mx.random.normal((1, length, key_heads, key_dim)), None, 1e-6)
+        k = scale * mx.fast.rms_norm(mx.random.normal((1, length, key_heads, key_dim)), None, 1e-6)
         v = mx.random.normal((1, length, value_heads, value_dim))
-        g = mx.random.uniform(shape=(1, length, value_heads))
+        g = mx.random.uniform(shape=(1, length, value_heads)) * 0.5 + 0.5
         beta = mx.random.uniform(shape=(1, length, value_heads))
         mx.eval(q, k, v, g, beta)
 
@@ -256,9 +307,9 @@ def test_the_backward_keeps_one_span_of_states_rather_than_every_token() -> None
         return mx.get_peak_memory() - base
 
     loop = peak_of(gated_delta.gated_delta_ops)
-    manual = peak_of(chunked_recurrence(32))
+    chunkwise = peak_of(chunked_recurrence(64))
     assert loop > length * state_bytes  # the loop really does keep per-token states
-    assert manual < loop / 4
+    assert chunkwise < loop / 4
 
 
 def test_the_recurrence_is_rerouted_only_for_the_span_of_a_backward(monkeypatch) -> None:
@@ -290,3 +341,51 @@ def test_the_recurrence_is_rerouted_only_for_the_span_of_a_backward(monkeypatch)
 def test_a_negative_recurrence_chunk_is_refused() -> None:
     with pytest.raises(ValueError, match="recurrence_chunk_size"):
         MLXEngineConfig(model_path="x", recurrence_chunk_size=-1)
+
+
+# ------------------------------------------------------ layer checkpointing
+
+
+def test_checkpointed_layers_give_the_same_gradients_and_are_unwrapped_afterwards(monkeypatch) -> None:
+    from mlx_lm.models import qwen3_5
+
+    plain = hybrid_engine(monkeypatch, lora_layers=6)
+    try:
+        _, expected = plain._run(lambda: plain._micro_batch_gradients(plain._pack(rows())))
+    finally:
+        plain.close()
+
+    original_call = qwen3_5.Qwen3_5DecoderLayer.__call__ if hasattr(qwen3_5, "Qwen3_5DecoderLayer") else None
+    monkeypatch.setattr(engine_module, "load", lambda path: (tiny_hybrid(), _Tokenizer()))
+    engine = MLXEngine(
+        MLXEngineConfig(
+            model_path="synthetic-qwen3_5",
+            lora_layers=6,
+            lora_rank=4,
+            micro_batch_size=2,
+            lora_keys=("self_attn.q_proj", "linear_attn.in_proj_qkv", "mlp.down_proj"),
+            checkpoint_layers=True,
+            seed=0,
+        )
+    )
+    try:
+        layer_class = type(engine._holder.model.layers[0])
+        unwrapped = layer_class.__call__
+        seen: list[bool] = []
+        scoring = engine_module._token_log_probs
+
+        def observing(model, sequences, mask):
+            seen.append(layer_class.__call__ is not unwrapped)
+            return scoring(model, sequences, mask)
+
+        monkeypatch.setattr(engine_module, "_token_log_probs", observing)
+        _, actual = engine._run(lambda: engine._micro_batch_gradients(engine._pack(rows())))
+        # Wrapped while the backward ran, and the very same function after.
+        assert seen == [True]
+        assert layer_class.__call__ is unwrapped
+        for name, grad in expected.items():
+            assert relative_deviation(grad, actual[name]) < 1e-5
+    finally:
+        engine.close()
+    if original_call is not None:
+        assert qwen3_5.Qwen3_5DecoderLayer.__call__ is original_call

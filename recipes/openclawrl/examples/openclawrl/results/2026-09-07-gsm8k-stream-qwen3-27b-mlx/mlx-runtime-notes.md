@@ -113,30 +113,38 @@ times their length. In order of effect: lower `micro_batch_size`, then
 
 On a hybrid model (Qwen3.5/3.8: three `GatedDeltaNet` layers to every
 full-attention one), `lora_layers` has a second cost. mlx-lm's `GatedDeltaNet`
-recurrence is a Metal kernel without a vjp in eval mode and a loop of plain ops
-in training mode, and that loop keeps three to four fp32 state matrices of
-48 × 128 × 128 per token per crossed layer for the backward — about 10.5 MB a
-token. The engine switches only the layers on the gradient's path into training
-mode, for the span of one backward, and gives the recurrence a hand-written
-backward (`reef.train.mlx_backend.gated_delta`, `recurrence_chunk_size` tokens a
-span, default 32) that keeps one state per span and recomputes the rest.
-Measured on Qwen3.8-27B-4bit, rank 256, one 700-token row, weights resident at
-15.1 GB:
+recurrence runs one token at a time: a Metal kernel without a vjp in eval mode
+and a loop of plain ops in training mode, and that loop keeps three to four
+fp32 state matrices of 48 × 128 × 128 per token per crossed layer for the
+backward — about 10.5 MB a token — while both directions are a chain of
+hundreds of tiny kernels. The engine switches only the layers on the
+gradient's path into training mode, for the span of one backward, and runs
+the recurrence there in its chunkwise form (`reef.train.mlx_backend.gated_delta`,
+ported from flash-linear-attention's reference; `recurrence_chunk_size`
+tokens a chunk, default 64): matrix products within a chunk, one state
+between chunks, and MLX's own autodiff for the backward. On the recurrence
+alone at this model's head shape, 700 tokens: 13.5 MB a token and 5.9 s for
+mlx-lm's loop, 0.7 MB a token held for the backward and 0.3 s chunkwise.
 
-| `lora_layers` | crossed `GatedDeltaNet` layers | mlx-lm's loop | hand-written backward |
-| --- | --- | --- | --- |
-| 3 | 2 | 30.0 GB, 23 s | |
-| 8 | 6 | killed, out of memory (60 GB projected) | 20.5 GB, 27.5 s |
-| 64 (every layer, 1.46 B adapter parameters) | 48 | | 47.5 GB, 729 s |
+Past a handful of layers the activations of the transformer blocks themselves
+are what fill memory, and `checkpoint_layers: true` recomputes each adapted
+layer's forward during the backward instead of keeping them. Measured on
+Qwen3.8-27B-4bit, one 700-token row, weights resident at 15.1 GB:
+
+| `lora_layers` | rank | `checkpoint_layers` | peak | backward |
+| --- | --- | --- | --- | --- |
+| 3, mlx-lm's loop | 256 | off | 30.0 GB | 23 s |
+| 8, mlx-lm's loop | 256 | off | killed, out of memory | |
+| 8 | 256 | off | 21.7 GB | 17.4 s |
+| 64 | 16 | off | 50.5 GB | 744 s |
+| 64 | 16 | on | 18.3 GB | 41.6 s |
+| 64 | 64 | on | 20.1 GB | 32.2 s |
 
 mlx-lm's loop is linear in length (3 layers: 19.9, 22.2, 24.2, 26.2 GB at
-200, 300, 400, 500 tokens). On the recurrence alone the hand-written backward
-holds 1 MB a token against the loop's 14.6 and runs six times faster. At 64
-layers the recurrence is no longer what fills memory: a rank-256 adapter over
-every layer is 5.9 GB of parameters plus their gradients and two Adam moments,
-and the 700-token backward over 64 adapted layers takes twelve minutes. Layers
-below the lowest adapted one keep the kernel and cost nothing extra, as does
-serving. Generation dominates step time, so `max_tokens`
+200, 300, 400, 500 tokens). Every layer of the model trains in 20 GB with
+checkpointing on; without it the 64-layer row sits at the machine's physical
+limit and the clock shows it. Layers below the lowest adapted one keep the
+kernel and cost nothing extra, as does serving. Generation dominates step time, so `max_tokens`
 is also the main throughput knob.
 
 For training rollouts the recorded behaviour proxy is the model's own log-softmax

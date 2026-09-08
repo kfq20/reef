@@ -47,18 +47,20 @@ reef:
     # 48 of this model's 64 layers are GatedDeltaNet, so the gradient reached
     # layer 63 (the last full-attention block) and layer 62's MLP and no
     # further — `lora_layers: 3` failed with [Primitive::vjp] Not
-    # implemented. The engine now puts the layers on the gradient's path into
-    # training mode for the backward, where the recurrence is plain
-    # differentiable ops with a hand-written backward
-    # (reef.train.mlx_backend.gated_delta), so the ceiling is unified memory
-    # and time. 8 reaches layers 56–63, crossing six GatedDeltaNet layers;
-    # measured on one 700-token row at rank 256 this peaks at 20.5 GB and
-    # the backward takes 27.5 s on an M4 Pro with 51.5 GB. Every layer (64)
-    # fits too, at 47.5 GB and a twelve-minute backward per row — at this
-    # rank the adapter and its optimizer state are what fill memory then.
-    # No run with this setting is recorded yet.
-    lora_layers: 8
-    lora_rank: 256
+    # implemented. The engine now runs the recurrence chunkwise in training
+    # mode (reef.train.mlx_backend.gated_delta) and, with checkpoint_layers,
+    # recomputes each layer's forward in the backward, so every layer trains:
+    # measured on one 700-token row this peaks at 20.1 GB with a 32 s
+    # backward on an M4 Pro with 51.5 GB (8 layers at rank 256: 21.7 GB,
+    # 17 s). The reference trains every parameter of every layer; this is
+    # the closest LoRA gets. No run with this setting is recorded yet, and
+    # the learning rate below was chosen against the two-layer run.
+    lora_layers: 64
+    # Rank 256 was the recorded run's, on two layers. Over all 64 the
+    # adapter and its Adam state are what fill memory at that rank (1.46 B
+    # parameters); 64 keeps them at 366 M.
+    lora_rank: 64
+    checkpoint_layers: true
     # k_proj and v_proj are adapted here, which rules out a cached prompt
     # prefill (it would freeze tensors that depend on trained weights).
     # prefill_step_size stays 0; these prompts are short.
