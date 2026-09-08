@@ -109,7 +109,18 @@ runs about 100–125 tok/s, which is the binding cost at those lengths, not memo
 
 Unified memory scales with the number of sequences held in one backward pass
 times their length. In order of effect: lower `micro_batch_size`, then
-`max_tokens`, then `lora_layers`. Generation dominates step time, so `max_tokens`
+`max_tokens`, then `lora_layers`.
+
+On a hybrid model (Qwen3.5/3.8: three `GatedDeltaNet` layers to every
+full-attention one), `lora_layers` has a second cost. mlx-lm's `GatedDeltaNet`
+recurrence is a Metal kernel without a vjp in eval mode and a loop of plain ops
+in training mode; the engine switches only the layers on the gradient's path
+into training mode, for the span of one backward. Every `GatedDeltaNet` layer
+the gradient crosses then runs its recurrence one token at a time and keeps
+its per-token state for the backward — `value_heads × value_dim × key_dim ×
+4 bytes` per token, about 3 MB on Qwen3.8-27B, so roughly 2 GB per crossed
+layer for a 700-token row. Layers below the lowest adapted one keep the kernel
+and cost nothing extra, as does serving. Generation dominates step time, so `max_tokens`
 is also the main throughput knob.
 
 For training rollouts the recorded behaviour proxy is the model's own log-softmax

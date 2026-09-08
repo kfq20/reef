@@ -42,12 +42,18 @@ reef:
   runtime_type: mlx
   runtime_config:
     checkpoint_dir: work/checkpoints
-    # The ceiling on this model, measured rather than guessed. 48 of its 64
-    # layers are GatedDeltaNet, whose kernel has no vjp, so a gradient cannot
-    # cross one. Layer 63 is the last full-attention block and is reachable
-    # whole; layer 62's MLP is reachable too, because the gradient arrives
-    # from 63 without passing through 62's attention. Layer 61 is not:
-    # `lora_layers: 3` fails with [Primitive::vjp] Not implemented.
+    # What this run trained, kept as recorded. At the time the engine ran its
+    # backward in eval mode, where mlx-lm's GatedDeltaNet uses a Metal kernel
+    # with no vjp; 48 of this model's 64 layers are GatedDeltaNet, so the
+    # gradient reached layer 63 (the last full-attention block) and layer
+    # 62's MLP and no further — `lora_layers: 3` failed with
+    # [Primitive::vjp] Not implemented. The engine now switches the layers on
+    # the gradient's path into training mode for the backward, where the
+    # recurrence is plain differentiable ops, so this ceiling no longer
+    # applies: raise it, and add `linear_attn.in_proj_qkv` to lora_keys to
+    # adapt the GatedDeltaNet layers themselves. Each GatedDeltaNet layer the
+    # gradient crosses keeps ~3 MB of state per token for the backward on
+    # this model, and runs its recurrence one token at a time.
     lora_layers: 2
     lora_rank: 256
     # k_proj and v_proj are adapted here, which rules out a cached prompt

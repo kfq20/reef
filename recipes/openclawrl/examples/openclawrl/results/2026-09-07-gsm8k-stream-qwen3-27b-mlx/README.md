@@ -65,15 +65,23 @@ The base never produced a clean reply on any of the twelve problems (240
 samples, zero). Note the final checkpoint answers *more* cleanly than the
 adapted one, not less — see "What collapses" below.
 
-## Why it is hard on this model
+## Why it was hard on this model
 
-48 of Qwen3.8-27B's 64 layers are `GatedDeltaNet`, whose kernel has no vjp, so a
-gradient cannot cross one. The reachable surface is **layer 63** (the last
+This run trained two layers of a 64-layer model. 48 of Qwen3.8-27B's layers are
+`GatedDeltaNet`, and the engine at the time ran its backward in eval mode, where
+mlx-lm implements that recurrence as a Metal kernel with no vjp, so a gradient
+could not cross one. The reachable surface was **layer 63** (the last
 full-attention block) whole, plus **layer 62's MLP** — the gradient reaches it
-from 63 without passing through 62's attention. `lora_layers: 3` fails with
+from 63 without passing through 62's attention. `lora_layers: 3` failed with
 `[Primitive::vjp] Not implemented`. At rank 256 that is ~45M trainable
-parameters. Learning two layers of a 27B is the whole difficulty; the KL-to-base
-term below is what keeps those two layers from wandering.
+parameters. Learning two layers of a 27B was the whole difficulty; the KL-to-base
+term below is what kept those two layers from wandering.
+
+That ceiling was the engine's, not the model's. mlx-lm switches `GatedDeltaNet`
+to a loop of plain, differentiable ops in training mode, and the engine now puts
+the layers on the gradient's path into training mode for the span of each
+backward (see `MLXEngine._differentiable`). A later run can adapt as many layers
+as unified memory allows; the numbers above stand as measured with two.
 
 ## Configuration
 

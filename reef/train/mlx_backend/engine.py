@@ -19,8 +19,9 @@ import os
 import shutil
 import tempfile
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -252,6 +253,24 @@ def _head_holder(model: nn.Module) -> Any:
     return None
 
 
+def _gradient_path_layers(model: nn.Module) -> list[nn.Module]:
+    """The decoder layers a gradient crosses on its way to a trainable weight.
+
+    The loss sits after the last layer, so the path runs from the lowest
+    layer holding a trainable parameter up to the top; everything below it
+    is a frozen prefix that no cotangent ever enters. When the model is not
+    a recognisable body-plus-head, the whole model is the path.
+    """
+    holder = _head_holder(model)
+    if holder is None:
+        return [model]
+    layers = list(holder.model.layers)
+    trainable = [index for index, layer in enumerate(layers) if _flat(layer.trainable_parameters())]
+    if not trainable:
+        return []
+    return layers[min(trainable) :]
+
+
 def _lora_reaches_keys_or_values(lora_keys: Sequence[str]) -> bool:
     """Whether the adapter changes what earlier positions contribute.
 
@@ -328,8 +347,13 @@ class MLXEngine:
         mx.random.seed(self._config.seed)
         # `load` returns a 3-tuple only with return_config=True.
         self._model, self._tokenizer = load(self._config.model_path)[:2]
+        # Eval mode is the engine's resting state, not something inherited
+        # from ``load``: it is what selects the fast kernels for serving, and
+        # ``_differentiable`` departs from it only for the span of a backward.
+        self._model.eval()
         self._model.freeze()
         linear_to_lora_layers(self._model, self._config.lora_layers, self._lora_parameters())
+        self._gradient_path = _gradient_path_layers(self._model)
         self._optimizer = optim.AdamW(
             learning_rate=self._config.learning_rate,
             weight_decay=self._config.weight_decay,
@@ -358,6 +382,34 @@ class MLXEngine:
             "dropout": self._config.lora_dropout,
             "keys": list(self._config.lora_keys),
         }
+
+    @contextmanager
+    def _differentiable(self) -> Iterator[None]:
+        """Training mode on the gradient's path, for the span of one backward.
+
+        mlx-lm's GatedDeltaNet carries two implementations of its recurrence
+        and picks by ``training``: in eval mode a Metal kernel that has no
+        vjp, in training mode a loop of plain ops that MLX can differentiate.
+        ``load`` leaves the model in eval mode, where a gradient stops dead at
+        the first GatedDeltaNet it meets — on a hybrid such as Qwen3.8 that
+        confines LoRA to the last full-attention block and the MLP beside it,
+        and ``[Primitive::vjp] Not implemented`` greets a third layer.
+
+        The ops loop runs one token at a time and keeps every token's
+        recurrent state for the backward pass, so it is switched on only
+        where the gradient actually travels. The frozen prefix keeps the
+        kernel and its forward costs what it always did; serving and the
+        forward-only scoring passes never enter here at all. On a model
+        without such a layer, training mode changes nothing (LoRA dropout is
+        the only other mode-dependent module, and it is off by default).
+        """
+        for layer in self._gradient_path:
+            layer.train()
+        try:
+            yield
+        finally:
+            for layer in self._gradient_path:
+                layer.eval()
 
     # ---------------------------------------------------------------- serving
 
@@ -889,8 +941,9 @@ class MLXEngine:
                 total = total + weights.kl_coef * self._sample_mean(per_token_kl, mask)
             return total
 
-        loss, grads = nn.value_and_grad(self._model, loss_fn)(self._model)
-        mx.eval(loss, grads)
+        with self._differentiable():
+            loss, grads = nn.value_and_grad(self._model, loss_fn)(self._model)
+            mx.eval(loss, grads)
         return _as_float(loss), dict(_flat(grads))
 
     @staticmethod
@@ -996,17 +1049,18 @@ class MLXEngine:
     def _micro_batch_gradients(self, tensors: _StepTensors) -> tuple[float, dict[str, mx.array]]:
         """Loss and gradients for one micro-batch of the TTT-Discover objective."""
         chunk = self._config.log_probs_chunk_size
-        if chunk and self._holder is not None and tensors.mask.shape[1] > chunk:
-            return self._chunked_gradients(tensors, chunk)
+        with self._differentiable():
+            if chunk and self._holder is not None and tensors.mask.shape[1] > chunk:
+                return self._chunked_gradients(tensors, chunk)
 
-        def loss_fn(model: nn.Module) -> mx.array:
-            log_probs = _token_log_probs(model, tensors.sequences, tensors.mask)
-            # rollout_log_probs is already laid out on target positions, so
-            # no shift is needed here.
-            return self._surrogate(log_probs, tensors.rollout_log_probs, tensors.advantages, tensors.mask)
+            def loss_fn(model: nn.Module) -> mx.array:
+                log_probs = _token_log_probs(model, tensors.sequences, tensors.mask)
+                # rollout_log_probs is already laid out on target positions, so
+                # no shift is needed here.
+                return self._surrogate(log_probs, tensors.rollout_log_probs, tensors.advantages, tensors.mask)
 
-        loss, grads = nn.value_and_grad(self._model, loss_fn)(self._model)
-        mx.eval(loss, grads)
+            loss, grads = nn.value_and_grad(self._model, loss_fn)(self._model)
+            mx.eval(loss, grads)
         return _as_float(loss), dict(_flat(grads))
 
     def _chunked_gradients(self, tensors: _StepTensors, chunk: int) -> tuple[float, dict[str, mx.array]]:
