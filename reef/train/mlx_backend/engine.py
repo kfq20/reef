@@ -84,6 +84,14 @@ class MLXEngineConfig:
     #: it has to be captured while generating — it cannot be recovered later.
     #: Zero records nothing, which is what a purely on-policy objective wants.
     capture_topk: int = 0
+    #: Upper bound, in GiB, on MLX's reusable buffer cache. MLX pools freed
+    #: buffers to avoid re-allocating; across a long run of generate+backward
+    #: cycles that pool grows until, on a memory-tight box, it crowds out the
+    #: model and the machine swaps — generation then crawls and agent turns hit
+    #: their timeout. Capping the pool returns buffers to the OS past the bound.
+    #: Zero leaves MLX's default (effectively unbounded). Pair with the
+    #: per-step ``clear_cache`` the training methods already call.
+    cache_limit_gib: float = 0.0
     #: Prompt tokens fed per pass when filling the attention cache. A bare
     #: forward over the whole sequence builds a ``[heads, length, length]``
     #: attention tensor — 206 GB at 65k tokens with 24 heads — which no
@@ -138,6 +146,8 @@ class MLXEngineConfig:
                 raise ValueError(f"{name} must be a positive integer")
         if self.temperature <= 0:
             raise ValueError("temperature must be positive")
+        if self.cache_limit_gib < 0:
+            raise ValueError("cache_limit_gib must be non-negative")
         if not self.lora_keys:
             raise ValueError("lora_keys must name at least one projection")
         if self.prefill_step_size < 0 or isinstance(self.prefill_step_size, bool):
@@ -398,6 +408,11 @@ class MLXEngine:
     def _bootstrap(self) -> None:
         """Load the model on the engine thread that will also generate on it."""
         mx.random.seed(self._config.seed)
+        if self._config.cache_limit_gib > 0:
+            # Bound MLX's reusable buffer pool so a long serve+train run cannot
+            # let it grow into swap. clear_cache after each step handles the
+            # training buffers; this caps the generation side between steps.
+            mx.set_cache_limit(int(self._config.cache_limit_gib * (2**30)))
         # `load` returns a 3-tuple only with return_config=True.
         self._model, self._tokenizer = load(self._config.model_path)[:2]
         # Eval mode is the engine's resting state, not something inherited
@@ -416,6 +431,19 @@ class MLXEngine:
     def _run(self, work: Callable[[], Any]) -> Any:
         """Execute ``work`` on the engine thread and re-raise what it raises."""
         return self._executor.submit(work).result()
+
+    def _release_step_memory(self) -> float:
+        """Return the backward's buffers to the OS; report live memory in GiB.
+
+        A full-layer backward allocates large intermediates that MLX would
+        otherwise keep pooled for reuse. Over a long serve+train run that pool
+        grows until it crowds the model into swap and generation stalls, so a
+        step drops it here. Runs on the engine thread (callers are already on
+        it), and reports active (non-cache) bytes so a run can watch the true
+        working set hold flat instead of climbing.
+        """
+        mx.clear_cache()
+        return mx.get_active_memory() / (2**30)
 
     def close(self) -> None:
         self._executor.shutdown(wait=True)
@@ -789,6 +817,7 @@ class MLXEngine:
             raise MLXEngineError("training step produced no gradients")
         self._optimizer.update(self._model, tree_unflatten(list(accumulated.items())))
         mx.eval(self._model.parameters(), self._optimizer.state)
+        active_gib = self._release_step_memory()
         return {
             "loss": total_loss,
             "importance_ratio": total_ratio / counted if counted else 0.0,
@@ -796,6 +825,7 @@ class MLXEngine:
             "response_tokens": counted,
             "rows": len(rows),
             "optimizer_step": _as_int(self._optimizer.step),
+            "active_gib": active_gib,
         }
 
     # ---------------------------------------------------- distillation (OPD)
@@ -971,11 +1001,13 @@ class MLXEngine:
             raise MLXEngineError("training step produced no gradients")
         self._optimizer.update(self._model, tree_unflatten(list(accumulated.items())))
         mx.eval(self._model.parameters(), self._optimizer.state)
+        active_gib = self._release_step_memory()
         return {
             "loss": total_loss,
             "rows": len(rows),
             "response_tokens": response_tokens,
             "optimizer_step": _as_int(self._optimizer.step),
+            "active_gib": active_gib,
             "w_rl": w_rl,
             "w_opd": w_opd,
             "kl_coef": kl_coef,
