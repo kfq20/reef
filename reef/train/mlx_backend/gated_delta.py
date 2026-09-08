@@ -3,17 +3,20 @@
 mlx-lm's GatedDeltaNet runs its recurrence as a Metal kernel in eval mode and,
 because that kernel has no vjp, as a loop of plain ops in training mode. The
 loop is differentiable, but MLX keeps every intermediate of every step for the
-backward — several state-sized tensors per token per layer, 11 MB a token on
-Qwen3.8-27B — and a 700-token row crossing two such layers does not fit in
-51 GB.
+backward — three to four state-sized tensors per token per crossed layer,
+about 10.5 MB a token on Qwen3.8-27B, linear in length. A 700-token row
+crossing six such layers (``lora_layers: 8``) would need about 60 GB.
 
 This is the same loop, cut into chunks that are ``mx.checkpoint``-ed: the
 backward keeps only the recurrent state at each chunk boundary and recomputes
 the steps inside a chunk when it needs them. The per-step arithmetic is
 mlx-lm's own compiled step, so the numbers are identical to the letter; only
-what is remembered changes. Measured on the same row and layers, the peak
-falls from out-of-memory to 23 GB, and it grows linearly with length from
-there.
+what is remembered changes. It buys less than the arithmetic promises — MLX
+schedules the recomputation of many chunks before it frees any of them, so
+the peak still grows with length, at roughly half the rate — but that half is
+what makes eight layers fit: 25 GB measured where 60 GB was projected. A
+hand-written backward that keeps chunk-boundary states only would need about
+a hundredth of either.
 """
 
 from __future__ import annotations

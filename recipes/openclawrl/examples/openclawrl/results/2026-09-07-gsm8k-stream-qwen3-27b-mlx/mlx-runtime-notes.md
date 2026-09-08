@@ -120,14 +120,21 @@ a checkpointed version of itself (`recurrence_chunk_size`, default 32 tokens a
 span). Measured on Qwen3.8-27B, rank 256, one row, `lora_layers: 3` (two
 `GatedDeltaNet` layers crossed), weights resident at 15.1 GB:
 
-| recurrence | 350 tokens | 700 tokens |
-| --- | --- | --- |
-| mlx-lm's loop as is | 22.9 GB peak | killed, out of memory |
-| checkpointed, 32-token spans | 19.8 GB peak, 12 s backward | 22.9 GB peak, 17 s backward |
+| recurrence | 200 | 300 | 400 | 500 | 700 tokens |
+| --- | --- | --- | --- | --- | --- |
+| mlx-lm's loop as is | 19.9 | 22.2 | 24.2 | 26.2 | 30.0 GB, 23 s backward |
+| checkpointed, 32-token spans | | | | | 22.9 GB, 17 s backward |
 
-That is about 5.6 MB per token per crossed layer with checkpointing, against
-11 MB without, and linear in length either way. Layers below the lowest adapted
-one keep the kernel and cost nothing extra, as does serving. Generation dominates step time, so `max_tokens`
+Both are linear in length: about 10.5 MB per token per crossed layer as mlx-lm
+ships it (three to four fp32 state matrices of 48 × 128 × 128 kept per step
+for the backward), about half that checkpointed. `lora_layers: 8` crosses six
+such layers; on the same 700-token row it was killed out of memory as shipped
+(60 GB projected) and peaks at 25.0 GB checkpointed, with a 44 s backward. The
+checkpointing buys less than the arithmetic promises because MLX schedules the
+recomputation of many spans before freeing any; a hand-written backward that
+keeps only span-boundary states would need about a hundredth of either. Layers
+below the lowest adapted one keep the kernel and cost nothing extra, as does
+serving. Generation dominates step time, so `max_tokens`
 is also the main throughput knob.
 
 For training rollouts the recorded behaviour proxy is the model's own log-softmax
