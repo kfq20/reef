@@ -1,0 +1,96 @@
+# MinT macaron-v1-tall + Terminal-Bench + Reef harness evolution.
+#
+# Prerequisites:
+#   - the openai shim running on 127.0.0.1:8971 (litellm wants a provider
+#     prefix the endpoint refuses):
+#       python -m recipes.mint_terminus.harness.openai_shim 8971 https://mintcn.macaron.xin
+#   - docker with the task images available (they pull on first episode)
+#   - the MinT key in the environment as MINT_API_KEY
+#
+# Start from the repository root:
+#   reef serve -c recipes/mint_terminus/deployment.yaml
+implementation: reef.train.cordis_backend.recipe:CordisRecipe
+
+model:
+  # The name episodes and the proposer use; the openai/ prefix is what
+  # litellm needs, the shim strips it before the endpoint sees it.
+  path: openai/macaron-v1-tall
+
+evolution:
+  adapter: terminus
+  propose: recipes.mint_terminus.harness.evolution:propose
+  evaluate: recipes.mint_terminus.harness.evolution:evaluate
+  # The wrapper (bin/reef-terminus-mint) carries the E2B credentials into
+  # the episode process: reef's LocalExecutor passes only PATH + the
+  # descriptor env, so episodes find the wrapper through PATH. run_all.sh
+  # puts bin/ on PATH before starting serve; a manual start must do the
+  # same: export PATH="<checkout>/recipes/mint_terminus/bin:$PATH".
+  binary: reef-terminus-mint
+  # Harbor task directories (absolute; episodes get a minimal env without
+  # REEF_EVAL_TASKS_DIR, and a bare name would read as a registry id).
+  tasks:
+    - /root/.reef-eval-tasks/continual-learning/terminal-bench/cancel-async-tasks
+    - /root/.reef-eval-tasks/continual-learning/terminal-bench/make-mips-interpreter
+  # Terminal-Bench episodes are slow (container build + multi-turn agent +
+  # verifier), so one generous timeout per episode and no repeats.
+  episode_timeout_s: 1800
+  executor: local
+  seed:
+    - id: rules
+      name: rules
+      config:
+        text: |
+          Work carefully: run commands to verify every claim before you
+          finish, and re-read the task instruction before you answer.
+    - id: verify-results
+      name: skill
+      config:
+        name: verify-results
+        text: |
+          # verify-results
+          ---
+          name: verify-results
+          description: Check work by running commands before declaring done.
+          ---
+
+          Before declaring a task complete, run a command that proves it:
+          re-run the failing case, print the file's content, or query the
+          installed state. If the check fails, keep working.
+    - id: agent-config
+      name: config
+      config:
+        data:
+          # The served model reasons at length; the default reply cap
+          # truncates its JSON and the episode dies when the parser sees
+          # no JSON. A generous cap keeps episodes alive.
+          llm_call_kwargs:
+            max_tokens: 16384
+
+data:
+  # One evolve step per failing report; only failures (score <= 0.0) batch.
+  batch_size: 1
+  max_score: 0.0
+  training_mode: auto
+
+reef:
+  host: 127.0.0.1
+  port: 8912
+  recipe: deployment
+  token: reef-local
+  # The shim, not the endpoint: Reef's own calls send the model name bare
+  # (which the shim also accepts) while episode configs carry openai/...
+  upstream_url: http://127.0.0.1:8971
+  upstream_api_key: ${MINT_API_KEY}
+  upstream_model: openai/macaron-v1-tall
+  inference_timeout_s: 600
+  agent_record_dir: recipes/mint_terminus/work/agent-record
+  artifact_repository: recipes/mint_terminus/work/artifacts.git
+  artifact_work_dir: recipes/mint_terminus/work/artifact-work
+  artifact_cache_dir: recipes/mint_terminus/work/artifact-cache
+
+run_dir: recipes/mint_terminus/work/stack
+
+services:
+  - name: reef
+    command: ["${REEF_PYTHON}", "-m", "reef.service"]
+    ready: curl -sf http://127.0.0.1:${reef.port}/healthz

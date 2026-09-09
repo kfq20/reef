@@ -1,0 +1,16 @@
+#!/bin/sh
+# Episode wrapper: reef's LocalExecutor passes only PATH + the descriptor env,
+# so the E2B credentials the terminus runner needs are set here, and the
+# environment mode selects harbor's remote e2b sandbox.
+#
+# Required in the environment (export before starting reef serve):
+#   E2B_API_KEY, E2B_API_URL   (E2B_SANDBOX_URL / E2B_DOMAIN default from it)
+# The reef-terminus binary comes from REEF_TERMINUS_BIN or PATH.
+set -e
+: "${E2B_API_KEY:?set E2B_API_KEY (see the recipe README)}"
+: "${E2B_API_URL:?set E2B_API_URL (e.g. http://<e2b-host>:<port>)}"
+export E2B_API_KEY E2B_API_URL
+export E2B_SANDBOX_URL="${E2B_SANDBOX_URL:-$E2B_API_URL}"
+export E2B_DOMAIN="${E2B_DOMAIN:-${E2B_API_URL#http://}}"
+export REEF_TERMINUS_ENVIRONMENT="${REEF_TERMINUS_ENVIRONMENT:-e2b}"
+exec "${REEF_TERMINUS_BIN:-reef-terminus}" "$@"
