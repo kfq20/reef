@@ -1653,6 +1653,12 @@ class ContinuousBatcher:
                 live.finish_reason = response.finish_reason
                 finished.append((live.ticket, self._rollout(live)))
                 self._live.pop(response.uid)
+        if not self._live and not self._has_queued():
+            # The batch drained. Return the decode's pooled buffers to the OS
+            # now, rather than letting the generation-side pool grow between
+            # the increasingly-spaced training steps (whose clear_cache is
+            # otherwise the only reclaim) until it crowds a training backward.
+            mx.clear_cache()
         return finished
 
     def _insert_queued(self) -> None:
