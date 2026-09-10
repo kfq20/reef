@@ -1,0 +1,99 @@
+# The full-benchmark self-improvement deployment: one gate over a stratified
+# 12-task subset of the 44 tmux-usable Terminal-Bench tasks, batches of all
+# failures per round, multiple evolve rounds.
+#
+# Same prerequisites as deployment.yaml (shim, E2B creds, task catalog); the
+# differences are data.batch_size (all failures at once, so the proposer sees
+# the whole round's failure distribution and must propose a general change),
+# the 12-task stratified gate set, and a per-task episode timeout that covers
+# the longest tasks (3600s agent + verifier + build).
+implementation: reef.train.cordis_backend.recipe:CordisRecipe
+
+model:
+  path: openai/macaron-v1-tall
+
+evolution:
+  adapter: terminus
+  propose: recipes.mint_terminus.harness.evolution:propose
+  evaluate: recipes.mint_terminus.harness.evolution:evaluate
+  # The wrapper (bin/reef-terminus-mint) carries the E2B credentials into
+  # the episode process; it must be on PATH before reef serve starts.
+  binary: reef-terminus-mint
+  # Stratified gate set: one medium task per category, 12 categories.
+  tasks:
+    - /root/.reef-eval-tasks/continual-learning/terminal-bench/build-pmars
+    - /root/.reef-eval-tasks/continual-learning/terminal-bench/break-filter-js-from-html
+    - /root/.reef-eval-tasks/continual-learning/terminal-bench/hf-model-inference
+    - /root/.reef-eval-tasks/continual-learning/terminal-bench/largest-eigenval
+    - /root/.reef-eval-tasks/continual-learning/terminal-bench/count-dataset-tokens
+    - /root/.reef-eval-tasks/continual-learning/terminal-bench/modernize-scientific-stack
+    - /root/.reef-eval-tasks/continual-learning/terminal-bench/nginx-request-logging
+    - /root/.reef-eval-tasks/continual-learning/terminal-bench/build-cython-ext
+    - /root/.reef-eval-tasks/continual-learning/terminal-bench/distribution-search
+    - /root/.reef-eval-tasks/continual-learning/terminal-bench/gcode-to-text
+    - /root/.reef-eval-tasks/continual-learning/terminal-bench/log-summary-date-ranges
+    - /root/.reef-eval-tasks/continual-learning/terminal-bench/portfolio-optimization
+  # Longest gate task is 3600s agent + verifier + first-time build: one
+  # episode may run ~70 minutes; the gate runs 2 trees x 12 tasks.
+  episode_timeout_s: 5400
+  executor: local
+  # Keep every step's proposer calls and parsed proposals on disk for debugging.
+  step_record_dir: recipes/mint_terminus/work-full/steps
+  seed:
+    - id: rules
+      name: rules
+      config:
+        text: |
+          Work carefully: run commands to verify every claim before you
+          finish, and re-read the task instruction before you answer.
+    - id: verify-results
+      name: skill
+      config:
+        name: verify-results
+        text: |
+          # verify-results
+          ---
+          name: verify-results
+          description: Check work by running commands before declaring done.
+          ---
+
+          Before declaring a task complete, run a command that proves it:
+          re-run the failing case, print the file's content, or query the
+          installed state. If the check fails, keep working.
+    - id: agent-config
+      name: config
+      config:
+        data:
+          # The served model reasons at length; the default reply cap
+          # truncates its JSON and the episode dies when the parser sees
+          # no JSON. A generous cap keeps episodes alive.
+          llm_call_kwargs:
+            max_tokens: 16384
+
+data:
+  # The driver submits one grouped trajectory report containing all real
+  # failures in a round, so one report opens one evolve step.
+  batch_size: 1
+  max_score: 0.5
+  training_mode: auto
+
+reef:
+  host: 127.0.0.1
+  port: 8912
+  recipe: deployment-full
+  token: reef-local
+  upstream_url: http://127.0.0.1:8971
+  upstream_api_key: ${MINT_API_KEY}
+  upstream_model: openai/macaron-v1-tall
+  inference_timeout_s: 1800
+  agent_record_dir: recipes/mint_terminus/work-full/agent-record
+  artifact_repository: recipes/mint_terminus/work-full/artifacts.git
+  artifact_work_dir: recipes/mint_terminus/work-full/artifact-work
+  artifact_cache_dir: recipes/mint_terminus/work-full/artifact-cache
+
+run_dir: recipes/mint_terminus/work-full/stack
+
+services:
+  - name: reef
+    command: ["${REEF_PYTHON}", "-m", "reef.service"]
+    ready: curl -sf http://127.0.0.1:${reef.port}/healthz

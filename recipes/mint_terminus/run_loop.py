@@ -2,11 +2,9 @@
 
 One pass:
 
-    record  - each task goes once through reef inference (a proxy turn that
-              reef records against a receipt; the score comes from the task's
-              own verdict, reported below)
-    report  - report a failing score (0.0) against the first receipt, which
-              batches (max_score: 0.0) and triggers one gated evolve step
+    episode - run the real Terminus episode and task verifier
+    report  - report only the verifier's real failure score against a receipt;
+              infrastructure errors are never converted into model failures
     poll    - wait for the step's verdict: the proposer (the same MinT model)
               reads the failure and proposes a rules/skill mutation; the gate
               runs current and candidate trees on the tasks; a win publishes
@@ -22,6 +20,8 @@ import sys
 import time
 
 import httpx
+
+from recipes.mint_terminus import baseline
 
 SERVICE_URL = os.environ.get("REEF_MINT_SERVICE_URL", "http://127.0.0.1:8912")
 SCENARIO = os.environ.get("REEF_MINT_SCENARIO", "mint-terminus-demo")
@@ -75,47 +75,19 @@ def main() -> int:
         timeout=INFERENCE_TIMEOUT_S,
     )
 
-    # record: one proxy inference per task, keeping the receipt
-    receipts = []
+    # Run the same real verifier used by the evolve gate. A proxy turn is only
+    # metadata; it must never be used to invent a failure score.
+    records = []
     for index, task in enumerate(tasks, start=1):
-        print(f"record: sending task {index} through Reef", flush=True)
-        with open(f"{task}/instruction.md", encoding="utf-8") as handle:
-            instruction = handle.read()
-        response = _inference(client, instruction)
-        receipt = response.headers["x-reef-agent-record-id"]
-        receipts.append(receipt)
-        print(f"task {index} recorded (receipt {receipt[:12]}...)", flush=True)
-        try:
-            body = response.json()
-            choices = body.get("choices") or []
-            content = ((choices[0].get("message") or {}).get("content") if choices else None)
-            if content:
-                print("  model response:", flush=True)
-                print(str(content)[:2000], flush=True)
-            elif choices:
-                reasoning = (choices[0].get("message") or {}).get("reasoning")
-                if reasoning:
-                    print("  model reasoning (response content was empty):", flush=True)
-                    print(str(reasoning)[:2000], flush=True)
-        except (ValueError, IndexError, AttributeError, TypeError):
-            pass
-
-    # report: a failing score batches and opens one evolve step
-    report = client.post(
-        "/reef/report",
-        json={
-            "agent_record_id": "mint-terminus-1",
-            "score": 0.0,
-            "feedback": "the agent did not finish the task within its turn budget",
-            "references": receipts,
-        },
-    )
-    report.raise_for_status()
-    print("failure reported; the evolve step is running (episodes take many minutes)", flush=True)
-    try:
-        print("  report:", json.dumps(report.json(), default=str))
-    except (ValueError, TypeError):
-        print("  report response:", report.text[:1000])
+        print(f"episode: running task {index} with the seed harness", flush=True)
+        record = baseline.run_one(task)
+        records.append(record)
+        print(f"task {index}: reward={record.get('reward')} ({baseline.classify_record(record)})", flush=True)
+    reported = baseline.report_results(records, client, report_tag="mint-terminus")
+    if not reported:
+        print("all tasks passed or were unscored; no evolve step triggered", flush=True)
+        return 0
+    print(f"reported {reported} real task failure(s); the evolve step is running", flush=True)
 
     # poll the releases catalog for the step's verdict
     deadline = time.monotonic() + STEP_TIMEOUT_S

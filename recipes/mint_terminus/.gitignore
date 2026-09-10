@@ -1,3 +1,5 @@
 work/
+work-full/
 work-serve.log
 __pycache__/
+bin/e2b.env
